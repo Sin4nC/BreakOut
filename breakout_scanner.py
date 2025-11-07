@@ -1,9 +1,10 @@
-# MEXC Spot USDT — 4H Pump Scanner (strict untouched + debug)
-# Rules:
-# 1) green full-body: body_ratio >= BODY_RATIO
-# 2) close > max(high of previous N), N in {15, 20}
-# 3) AFTER that candle: for all future candles j>i -> high[j] < high[i] AND low[j] > low[i]
-# Universe: spot USDT tickers, excluding leveraged-style symbols
+# MEXC Spot USDT — 4H Pump Scanner (strict: no bottom wick)
+# Finds any 4H candle in a recent window that:
+#   1) is green full-body: body_ratio >= BODY_RATIO
+#   2) close > max(high of previous N), N in N_LIST
+#   3) AFTER that candle, no later candle takes its high or its low
+#   4) ~no bottom shadow: (open - low) <= LOWER_WICK_MAX_PCT * (high - low)
+# Universe: spot USDT tickers (excludes 3L/3S/5L/5S/UP/DOWN/BULL/BEAR)
 
 import requests
 import pandas as pd
@@ -13,19 +14,16 @@ from datetime import datetime, timezone
 
 BASE = "https://api.mexc.com"
 
-INTERVAL      = "4h"
-N_LIST        = [15, 20]
-SEARCH_WINDOW = 300
-BODY_RATIO    = 0.7
-EPS           = 1e-9
-LIMIT         = 500
-MAX_WORKERS   = 10
+INTERVAL       = "4h"
+N_LIST         = [15, 20]
+SEARCH_WINDOW  = 300          # how many recent 4H candles to scan
+BODY_RATIO     = 0.7
+LOWER_WICK_MAX_PCT = 0.002    # <= 0.2% of range (very strict). Raise to 0.005 if needed.
+EPS            = 1e-12
+LIMIT          = 500
+MAX_WORKERS    = 10
 
 EXCLUDES = ("3L","3S","5L","5S","UP","DOWN","BULL","BEAR")
-
-# Add any symbols you want deep-diagnostics for
-DEBUG = True
-DEBUG_SYMBOLS = {"HIPPOUSDT", "AIAUSDT"}  # you can edit this set
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/ticker/price", timeout=25)
@@ -73,14 +71,18 @@ def find_hits_strict(df):
     l = df["l"].to_numpy(float)
     c = df["c"].to_numpy(float)
 
-    rng = np.maximum(h - l, 1e-12)
+    rng = np.maximum(h - l, EPS)
     br  = np.abs(c - o) / rng
     green_full = (c > o) & (br >= BODY_RATIO)
 
-    highs_series = pd.Series(h)
-    prior_highs = {n: highs_series.rolling(n).max().shift(1).to_numpy() for n in N_LIST}
+    # "almost no bottom wick" on a green candle: open ~ low
+    bottom_wick_ok = (o - l) <= (LOWER_WICK_MAX_PCT * rng + 1e-15)
 
-    # suffix max/min for untouched rule
+    highs_series = pd.Series(h)
+    prior_highs = {nlook: highs_series.rolling(nlook).max().shift(1).to_numpy()
+                   for nlook in N_LIST}
+
+    # suffix max/min for untouched rule (future candles)
     smax = np.empty(n, dtype=float)
     smin = np.empty(n, dtype=float)
     smax[last_idx] = -np.inf
@@ -91,9 +93,10 @@ def find_hits_strict(df):
 
     hits = []
     for i in range(start_i, n):
-        if not green_full[i]:
+        if not (green_full[i] and bottom_wick_ok[i]):
             continue
 
+        # breakout condition for any lookback in N_LIST
         ok_break = False
         used_n = None
         for nlook in N_LIST:
@@ -104,48 +107,24 @@ def find_hits_strict(df):
         if not ok_break:
             continue
 
-        # strict untouched afterwards
-        if smax[i] >= h[i] - EPS:
+        # untouched afterwards: no future high >= this high AND no future low <= this low
+        if smax[i] >= h[i] - EPS:   # future took the high -> reject
             continue
-        if smin[i] <= l[i] + EPS:
+        if smin[i] <= l[i] + EPS:   # future took the low  -> reject
             continue
 
         hits.append((i, used_n))
+
     return hits
 
 def ts_utc(ms):
     return datetime.fromtimestamp(int(ms)//1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-def diagnose_symbol(sym, df):
-    # Print the best candidate in last ~40 candles and why it failed
-    look = min(len(df), 40)
-    sub = df.tail(look).copy().reset_index(drop=True)
-    o = sub["o"].astype(float).to_numpy()
-    h = sub["h"].astype(float).to_numpy()
-    l = sub["l"].astype(float).to_numpy()
-    c = sub["c"].astype(float).to_numpy()
-
-    br = np.abs(c - o) / np.maximum(h - l, 1e-12)
-    # candidate = max of body * breakout factor
-    highs_series = pd.Series(h)
-    score = np.zeros(len(sub))
-    for nlook in N_LIST:
-        ph = highs_series.rolling(nlook).max().shift(1).to_numpy()
-        score = np.maximum(score, br * (c / np.maximum(ph, 1e-12)))
-    k = int(np.nanargmax(score))
-    row = sub.iloc[k]
-    # recompute checks on original index
-    print(f"[DEBUG] {sym} best recent @ {ts_utc(row['t'])} "
-          f"o={row['o']:.8g} h={row['h']:.8g} l={row['l']:.8g} c={row['c']:.8g} "
-          f"body={body_ratio(row['o'],row['h'],row['l'],row['c']):.3f}")
 
 def scan_symbol(sym):
     try:
         df = fetch_klines(sym)
         found = find_hits_strict(df)
         if not found:
-            if DEBUG and sym in DEBUG_SYMBOLS and df is not None:
-                diagnose_symbol(sym, df)
             return []
         last_idx = len(df) - 1
         out = []
@@ -159,6 +138,8 @@ def scan_symbol(sym):
                 "n_used": int(n_used) if n_used else max(N_LIST),
                 "hi": float(row["h"]),
                 "lo": float(row["l"]),
+                "bottom_wick": float(row["o"] - row["l"]),
+                "range": float(row["h"] - row["l"]),
                 "candles_ago": int(last_idx - i),
             })
         return out
@@ -180,7 +161,8 @@ if __name__ == "__main__":
     if not hits:
         print("no signals")
     else:
-        print("symbol,time_utc,close,body,n_used,hi,lo,candles_ago")
+        print("symbol,time_utc,close,body,n_used,hi,lo,bottom_wick,range,candles_ago")
         for r in hits:
             print(f"{r['symbol']},{r['time_utc']},{r['close']:.8g},{r['body']:.2f},"
-                  f"{r['n_used']},{r['hi']:.8g},{r['lo']:.8g},{r['candles_ago']}")
+                  f"{r['n_used']},{r['hi']:.8g},{r['lo']:.8g},{r['bottom_wick']:.8g},"
+                  f"{r['range']:.8g},{r['candles_ago']}")
