@@ -1,9 +1,8 @@
-# MEXC Spot USDT — 4H Pump Scanner (strict untouched rule, English-only)
+# MEXC Spot USDT — 4H Pump Scanner (strict untouched + debug)
 # Rules:
-# 1) green full-body: body_ratio >= 0.7
+# 1) green full-body: body_ratio >= BODY_RATIO
 # 2) close > max(high of previous N), N in {15, 20}
-# 3) AFTER that candle, for all future candles j>i:
-#       high[j] < high[i]  AND  low[j] > low[i]
+# 3) AFTER that candle: for all future candles j>i -> high[j] < high[i] AND low[j] > low[i]
 # Universe: spot USDT tickers, excluding leveraged-style symbols
 
 import requests
@@ -23,6 +22,10 @@ LIMIT         = 500
 MAX_WORKERS   = 10
 
 EXCLUDES = ("3L","3S","5L","5S","UP","DOWN","BULL","BEAR")
+
+# Add any symbols you want deep-diagnostics for
+DEBUG = True
+DEBUG_SYMBOLS = {"HIPPOUSDT", "AIAUSDT"}  # you can edit this set
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/ticker/price", timeout=25)
@@ -74,7 +77,6 @@ def find_hits_strict(df):
     br  = np.abs(c - o) / rng
     green_full = (c > o) & (br >= BODY_RATIO)
 
-    # rolling highs for both lookbacks
     highs_series = pd.Series(h)
     prior_highs = {n: highs_series.rolling(n).max().shift(1).to_numpy() for n in N_LIST}
 
@@ -109,17 +111,41 @@ def find_hits_strict(df):
             continue
 
         hits.append((i, used_n))
-
     return hits
 
 def ts_utc(ms):
     return datetime.fromtimestamp(int(ms)//1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def diagnose_symbol(sym, df):
+    # Print the best candidate in last ~40 candles and why it failed
+    look = min(len(df), 40)
+    sub = df.tail(look).copy().reset_index(drop=True)
+    o = sub["o"].astype(float).to_numpy()
+    h = sub["h"].astype(float).to_numpy()
+    l = sub["l"].astype(float).to_numpy()
+    c = sub["c"].astype(float).to_numpy()
+
+    br = np.abs(c - o) / np.maximum(h - l, 1e-12)
+    # candidate = max of body * breakout factor
+    highs_series = pd.Series(h)
+    score = np.zeros(len(sub))
+    for nlook in N_LIST:
+        ph = highs_series.rolling(nlook).max().shift(1).to_numpy()
+        score = np.maximum(score, br * (c / np.maximum(ph, 1e-12)))
+    k = int(np.nanargmax(score))
+    row = sub.iloc[k]
+    # recompute checks on original index
+    print(f"[DEBUG] {sym} best recent @ {ts_utc(row['t'])} "
+          f"o={row['o']:.8g} h={row['h']:.8g} l={row['l']:.8g} c={row['c']:.8g} "
+          f"body={body_ratio(row['o'],row['h'],row['l'],row['c']):.3f}")
 
 def scan_symbol(sym):
     try:
         df = fetch_klines(sym)
         found = find_hits_strict(df)
         if not found:
+            if DEBUG and sym in DEBUG_SYMBOLS and df is not None:
+                diagnose_symbol(sym, df)
             return []
         last_idx = len(df) - 1
         out = []
@@ -131,9 +157,9 @@ def scan_symbol(sym):
                 "close": float(row["c"]),
                 "body": round(body_ratio(row["o"], row["h"], row["l"], row["c"]), 3),
                 "n_used": int(n_used) if n_used else max(N_LIST),
-                "candles_ago": int(last_idx - i),
                 "hi": float(row["h"]),
                 "lo": float(row["l"]),
+                "candles_ago": int(last_idx - i),
             })
         return out
     except Exception:
