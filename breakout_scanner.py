@@ -1,6 +1,6 @@
 # Breakout scanner for MEXC USDT spot pairs
-# Finds the FIRST near full-body breakout over the highs of last N candles
-# Searches a recent window so you dont miss moves that happened a few candles ago
+# Rule: FIRST full-body breakout above the highs of the last 20 candles
+# 4h body ratio = 0.7  daily/weekly = 0.6
 
 import requests
 import pandas as pd
@@ -10,18 +10,28 @@ from datetime import datetime, timezone
 BASE = "https://api.mexc.com"
 USDT_ONLY = True
 
-# for faster test keep only 4h first  you can add "1d","1w" later
-INTERVALS = ["4h"]
+# intervals to scan  add/remove as needed
+INTERVALS = ["4h", "1d", "1w"]
 
-N_LOOKBACK = 12          # set 10..15 as you like
-BODY_RATIO_MIN = 0.6     # full body threshold
-SEARCH_WINDOW = 30       # how many recent candles to scan
-EPS_PCT = 0.002          # 0.2 percent tolerance around prior high
+# lookback for prior highs
+N_LOOKBACK = 20
 
+# window of recent candles to search so you do not miss earlier signals
+SEARCH_WINDOW = 60
+
+# body ratio per interval  per your rule 4h stricter
+BODY_RATIO_BY_INTERVAL = {
+    "4h": 0.7,
+    "1d": 0.6,
+    "1w": 0.6,
+}
+
+# request + scan settings
 LIMIT = 300
 MAX_WORKERS = 6
 
 def get_symbols():
+    """Fetch all spot USDT symbols from MEXC and filter out leveraged tokens."""
     r = requests.get(f"{BASE}/api/v3/exchangeInfo", timeout=20)
     r.raise_for_status()
     out = []
@@ -33,12 +43,13 @@ def get_symbols():
         sym = s.get("symbol", "")
         if USDT_ONLY and not sym.endswith("USDT"):
             continue
-        if any(x in sym for x in ["3L","3S","5L","5S"]):
+        if any(x in sym for x in ["3L", "3S", "5L", "5S"]):
             continue
         out.append(sym)
     return sorted(set(out))
 
 def fetch_klines(symbol, interval, limit=LIMIT):
+    """Read klines  fallback to Hour4 Day1 Week1 if needed."""
     url = f"{BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=20)
@@ -57,44 +68,44 @@ def fetch_klines(symbol, interval, limit=LIMIT):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
-def is_full_body(o, h, l, c, min_ratio=BODY_RATIO_MIN):
+def is_full_body(o, h, l, c, min_ratio):
+    """True if body length is at least min_ratio of total range."""
     rng = h - l
     if rng <= 0:
         return False
     body = abs(c - o)
     return (body / rng) >= min_ratio
 
-def breakout_index(df):
-    """return index of the FIRST breakout in the last SEARCH_WINDOW candles or None"""
+def breakout_index(df, interval):
+    """
+    Return index of the FIRST candle in the last SEARCH_WINDOW that:
+    - is full-body per BODY_RATIO_BY_INTERVAL[interval]
+    - OPEN and CLOSE are BOTH above the max high of the previous N_LOOKBACK candles
+    - previous candle was NOT already such a breakout
+    """
     if df is None or len(df) < N_LOOKBACK + 2:
         return None
+
+    min_ratio = BODY_RATIO_BY_INTERVAL.get(interval, 0.6)
+    # search older -> newer to ensure we alert the first one
     start = max(N_LOOKBACK + 1, len(df) - SEARCH_WINDOW)
     for i in range(start, len(df)):
         o, h, l, c = df.iloc[i][["o","h","l","c"]]
         op, hp, lp, cp = df.iloc[i-1][["o","h","l","c"]]
+
         prior_high      = df["h"].iloc[i - N_LOOKBACK : i].max()
         prior_high_prev = df["h"].iloc[i - N_LOOKBACK - 1 : i - 1].max()
 
-        # body quality
-        body_ok = is_full_body(o, h, l, c)
+        # current candle conditions
+        body_ok   = is_full_body(o, h, l, c, min_ratio)
+        break_now = (o > prior_high) and (c > prior_high)
 
-        # strict body entirely above prior high with tiny tolerance
-        strict_break = min(o, c) > prior_high * (1 - EPS_PCT)
+        # ensure previous candle was not already a valid breakout
+        prev_body_ok   = is_full_body(op, hp, lp, cp, min_ratio)
+        prev_break_now = (op > prior_high_prev) and (cp > prior_high_prev)
+        was_prev_break = prev_body_ok and prev_break_now
 
-        # relaxed  close above prior high and at least 90 percent of body sits above
-        body_len = abs(c - o)
-        above_len = max(0.0, max(o, c) - prior_high)
-        relaxed_break = (c > prior_high) and (body_len > 0) and (above_len / body_len >= 0.9)
-
-        # ensure previous candle was not already a qualifying breakout
-        prev_body_ok = is_full_body(op, hp, lp, cp)
-        prev_strict = min(op, cp) > prior_high_prev * (1 - EPS_PCT)
-        prev_above_len = max(0.0, max(op, cp) - prior_high_prev)
-        prev_body_len = abs(cp - op)
-        prev_relaxed = (cp > prior_high_prev) and (prev_body_len > 0) and (prev_above_len / prev_body_len >= 0.9)
-        prev_break = prev_body_ok and (prev_strict or prev_relaxed)
-
-        if body_ok and (strict_break or relaxed_break) and not prev_break:
+        if body_ok and break_now and not was_prev_break:
             return i
     return None
 
@@ -106,14 +117,15 @@ def scan_symbol(sym):
     for itv in INTERVALS:
         try:
             df = fetch_klines(sym, itv)
-            idx = breakout_index(df)
+            idx = breakout_index(df, itv)
             if idx is not None:
                 row = df.iloc[idx]
                 alerts.append(
-                    f"{sym}  {itv}  ALERT  FIRST NEAR FULL BODY BREAK  "
+                    f"{sym}  {itv}  ALERT  FIRST FULL-BODY BREAK "
                     f"lookback {N_LOOKBACK}  candle_time {human_time(row['t'])}  close {row['c']:.6g}"
                 )
         except Exception:
+            # ignore per-symbol errors to keep scanner running
             pass
     return alerts
 
