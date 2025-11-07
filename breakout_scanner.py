@@ -14,11 +14,21 @@ LIMIT = 300  # Candles to fetch
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/exchangeInfo")
+    r.raise_for_status()
     symbols = []
     for s in r.json()["symbols"]:
+        if s["status"] != "1":  # 1 means TRADING
+            continue
+        if not s.get("isSpotTradingAllowed", False):
+            continue
         sym = s["symbol"]
-        if s["status"] == "TRADING" and sym.endswith("USDT") and "spot" in s["permissions"]:
-            symbols.append(sym)
+        if not sym.endswith("USDT"):
+            continue
+        if "SPOT" not in s.get("permissions", []):
+            continue
+        if any(x in sym for x in ["3L", "3S", "5L", "5S"]):
+            continue
+        symbols.append(sym)
     return symbols
 
 def fetch_klines(sym):
@@ -27,7 +37,10 @@ def fetch_klines(sym):
     if r.status_code != 200:
         params["interval"] = "Hour4"
         r = requests.get(f"{BASE}/api/v3/klines", params=params)
+    r.raise_for_status()
     data = r.json()
+    if not data:
+        return None
     df = pd.DataFrame(data, columns=["t", "o", "h", "l", "c", "v"])
     df[["o", "h", "l", "c"]] = df[["o", "h", "l", "c"]].astype(float)
     return df
@@ -36,16 +49,17 @@ def body_ratio(o, h, l, c):
     return abs(c - o) / (h - l) if (h - l) > 0 else 0
 
 def find_pumps(df):
-    if len(df) < max(N_LIST) + 1:
+    if df is None or len(df) < max(N_LIST) + 1:
         return []
     o, h, l, c = df["o"].values, df["h"].values, df["l"].values, df["c"].values
-    br = [body_ratio(o[i], h[i], l[i], c[i]) for i in range(len(df))]
-    green_full = (c > o) & (np.array(br) >= BODY_RATIO)
+    br = np.array([body_ratio(o[i], h[i], l[i], c[i]) for i in range(len(df))])
+    green_full = (c > o) & (br >= BODY_RATIO)
     
     pumps = []
     for n in N_LIST:
         prior_high = pd.Series(h).shift(1).rolling(n).max().values
-        cond = green_full & (c > prior_high)
+        eps = np.maximum(np.abs(prior_high) * 0.001, 1e-12)  # tolerance
+        cond = green_full & (c > (prior_high + eps))
         for idx in np.where(cond)[0]:
             if idx >= len(df) - SEARCH_WINDOW:
                 pumps.append((idx, n))
@@ -66,8 +80,8 @@ def scan_all():
                 ago = len(df) - 1 - idx
                 hit = f"{sym} 4h PUMP n={n} ago={ago} time={human_time(row['t'])} close={row['c']:.6g} body={body_ratio(row['o'], row['h'], row['l'], row['c']):.2f}"
                 hits.append(hit)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error for {sym}: {e}")
     if hits:
         for h in sorted(hits):
             print(h)
