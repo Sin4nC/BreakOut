@@ -1,6 +1,6 @@
 # breakout_scanner.py
 # MEXC Spot USDT — 4H Pump Scanner + Universe Export
-# Exact rules:
+# Rules:
 # 1) timeframe 4H
 # 2) green full-body: body_ratio >= 0.7
 # 3) close > max(high of previous 15 or 20 candles)
@@ -8,12 +8,14 @@
 # 5) untouched: ONLY the NEXT candle's LOW must NOT touch/break the signal's LOW  (next_low)
 
 import argparse
+import math
 import requests, pandas as pd, numpy as np, concurrent.futures as fut
 from math import ceil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-BASE = "https://api.mexc.com"
+BASE_V3 = "https://api.mexc.com"
+BASE_OPEN = "https://www.mexc.com"
 
 INTERVAL = "4h"
 N_LIST = [15, 20]
@@ -35,14 +37,14 @@ LATEST_PER_SYMBOL = False
 def make_session():
     s = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=0.5,
+        total=4,
+        backoff_factor=0.6,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "mexc-4h-pump-scanner/1.2"})
+    s.headers.update({"User-Agent": "mexc-4h-pump-scanner/1.3"})
     return s
 
 SES = make_session()
@@ -50,91 +52,6 @@ SES = make_session()
 def dbg(sym, *msg):
     if VERBOSE and (not WATCH or sym in WATCH):
         print(sym, *msg)
-
-# ---------- exchange info ----------
-def load_exchange_info():
-    r = SES.get(f"{BASE}/api/v3/exchangeInfo", timeout=30)
-    r.raise_for_status()
-    return r.json() or {}
-
-def parse_filters(filters):
-    out = {"tickSize": None, "stepSize": None, "minQty": None, "minNotional": None}
-    for f in filters or []:
-        ft = str(f.get("filterType", "")).upper()
-        if ft in ("PRICE_FILTER", "PRICEFILTER"):
-            v = f.get("tickSize") or f.get("minPrice")
-            try: out["tickSize"] = float(v) if v is not None else None
-            except: pass
-        elif ft in ("LOT_SIZE", "LOTSIZE"):
-            for k in ("stepSize", "minQty"):
-                v = f.get(k)
-                try: out[k] = float(v) if v is not None else None
-                except: pass
-        elif "NOTIONAL" in ft:
-            v = f.get("minNotional")
-            try: out["minNotional"] = float(v) if v is not None else None
-            except: pass
-    return out
-
-# ---------- universe with tick sizes ----------
-def load_universe(quote_filter="USDT", include_all_quotes=False):
-    """
-    Return:
-      symbols: list[str]
-      ticks: dict[symbol->tickSize]
-      raw: list[dict] raw symbol objects for export
-    """
-    data = load_exchange_info()
-    raw = []
-    syms, ticks = [], {}
-    for s in data.get("symbols", []):
-        sym = s.get("symbol", "")
-        base = s.get("baseAsset", "")
-        quote = s.get("quoteAsset", "")
-        status = str(s.get("status", "")).upper()
-
-        if not include_all_quotes and quote != quote_filter:
-            continue
-        if any(x in sym for x in EXCLUDES):
-            continue
-        if status not in ("TRADING", "ENABLED", "OPEN"):
-            continue
-
-        filt = parse_filters(s.get("filters", []))
-        tick = filt["tickSize"] or FALLBACK_TICK
-
-        ticks[sym] = tick
-        syms.append(sym)
-        raw.append({
-            "symbol": sym,
-            "baseAsset": base,
-            "quoteAsset": quote,
-            "status": status,
-            "tickSize": filt["tickSize"],
-            "stepSize": filt["stepSize"],
-            "minQty": filt["minQty"],
-            "minNotional": filt["minNotional"],
-        })
-    return sorted(set(syms)), ticks, raw
-
-# ---------- data ----------
-def fetch_klines(symbol, interval=INTERVAL, limit=LIMIT):
-    url = f"{BASE}/api/v3/klines"
-    p = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = SES.get(url, params=p, timeout=25)
-    if r.status_code != 200:
-        p["interval"] = "Hour4"  # fallback alias seen on some gateways
-        r = SES.get(url, params=p, timeout=25)
-    r.raise_for_status()
-    rows = r.json()
-    if not rows or len(rows[0]) < 6:
-        return None
-    cols = ["t","o","h","l","c","v","ct","qv","n","tb","tqv","i"]
-    df = pd.DataFrame(rows, columns=cols[:len(rows[0])])
-    for col in ["o","h","l","c","v"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
 
 # ---------- helpers ----------
 def ts_utc(ms):
@@ -160,13 +77,193 @@ def bottom_wick_ticks_exact(open_p, low_p, tick):
     diff = max(0.0, float(open_p) - float(low_p))
     return int(ceil(diff / float(tick) - 1e-12))
 
+def _pow10(n):
+    try:
+        return 10.0 ** float(n)
+    except:
+        return None
+
+def _norm_symbol(sym: str) -> str:
+    # "BTC_USDT" -> "BTCUSDT"
+    return str(sym).replace("_", "").upper()
+
+# ---------- primary exchange info ----------
+def load_exchange_info_v3():
+    r = SES.get(f"{BASE_V3}/api/v3/exchangeInfo", timeout=30)
+    if r.status_code != 200:
+        return {}
+    try:
+        return r.json() or {}
+    except:
+        return {}
+
+def parse_filters(filters):
+    out = {"tickSize": None, "stepSize": None, "minQty": None, "minNotional": None}
+    for f in filters or []:
+        ft = str(f.get("filterType", "")).upper()
+        if ft in ("PRICE_FILTER", "PRICEFILTER"):
+            v = f.get("tickSize") or f.get("minPrice")
+            try: out["tickSize"] = float(v) if v is not None else None
+            except: pass
+        elif ft in ("LOT_SIZE", "LOTSIZE"):
+            for k in ("stepSize", "minQty"):
+                v = f.get(k)
+                try: out[k] = float(v) if v is not None else None
+                except: pass
+        elif "NOTIONAL" in ft:
+            v = f.get("minNotional")
+            try: out["minNotional"] = float(v) if v is not None else None
+            except: pass
+    return out
+
+# ---------- fallbacks ----------
+def fallback_from_ticker_price(quote="USDT"):
+    """/api/v3/ticker/price -> symbols only, tick=FALLBACK_TICK"""
+    try:
+        r = SES.get(f"{BASE_V3}/api/v3/ticker/price", timeout=25)
+        r.raise_for_status()
+        syms = []
+        ticks = {}
+        raw = []
+        for it in r.json():
+            sym = str(it.get("symbol","")).upper()
+            if not sym.endswith(quote): continue
+            if any(x in sym for x in EXCLUDES): continue
+            syms.append(sym)
+            ticks.setdefault(sym, FALLBACK_TICK)
+            raw.append({"symbol": sym, "baseAsset": None, "quoteAsset": quote,
+                        "status": "UNKNOWN", "tickSize": None, "stepSize": None,
+                        "minQty": None, "minNotional": None})
+        return sorted(set(syms)), ticks, raw
+    except:
+        return [], {}, []
+
+def fallback_from_openapi_symbols(quote="USDT"):
+    """
+    https://www.mexc.com/open/api/v2/market/symbols
+    fields: symbol like 'BTC_USDT', state 'ENABLED', price_scale, quantity_scale
+    """
+    urls = [
+        f"{BASE_OPEN}/open/api/v2/market/symbols",
+        f"{BASE_OPEN}/open/api/v3/market/symbols",
+    ]
+    for url in urls:
+        try:
+            r = SES.get(url, timeout=25)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            data = j.get("data") or j.get("symbols") or []
+            syms, ticks, raw = [], {}, []
+            for s in data:
+                raw_sym = s.get("symbol") or s.get("symbolName") or ""
+                status = (s.get("state") or s.get("status") or "").upper()
+                price_scale = s.get("price_scale") or s.get("priceScale") or s.get("price_tick")
+                sym = _norm_symbol(raw_sym)
+                if not sym.endswith(quote): continue
+                if any(x in sym for x in EXCLUDES): continue
+                if status and status not in ("ENABLED","TRADING","OPEN","NORMAL","ACTIVE"):
+                    continue
+                tick = None
+                p10 = _pow10(-float(price_scale)) if price_scale is not None else None
+                if p10 and p10 > 0:
+                    tick = float(p10)
+                ticks[sym] = tick if tick else FALLBACK_TICK
+                syms.append(sym)
+                raw.append({
+                    "symbol": sym,
+                    "baseAsset": None,
+                    "quoteAsset": quote,
+                    "status": status or "UNKNOWN",
+                    "tickSize": tick,
+                    "stepSize": None,
+                    "minQty": None,
+                    "minNotional": None,
+                })
+            if syms:
+                return sorted(set(syms)), ticks, raw
+        except:
+            pass
+    return [], {}, []
+
+# ---------- universe with robust fallbacks ----------
+def load_universe(quote_filter="USDT", include_all_quotes=False):
+    """
+    Returns:
+      symbols: list[str]
+      ticks: dict[symbol->tickSize]
+      raw:    list[dict] for export
+    Robust strategy:
+      1) /api/v3/exchangeInfo
+      2) /open/api/v2|v3/market/symbols
+      3) /api/v3/ticker/price
+    """
+    if include_all_quotes:
+        quote_filter = None  # accept all quotes
+
+    syms, ticks, raw = [], {}, []
+
+    # try v3 exchangeInfo
+    data = load_exchange_info_v3()
+    for s in data.get("symbols", []):
+        sym = str(s.get("symbol", "")).upper()
+        base = s.get("baseAsset", "")
+        quote = s.get("quoteAsset", "")
+        status = str(s.get("status", "")).upper()
+        if quote_filter and quote != quote_filter:
+            continue
+        if any(x in sym for x in EXCLUDES): continue
+        if status and status not in ("TRADING","ENABLED","OPEN","ACTIVE","NORMAL"):
+            continue
+        filt = parse_filters(s.get("filters", []))
+        tick = filt["tickSize"] or FALLBACK_TICK
+        ticks[sym] = tick
+        syms.append(sym)
+        raw.append({
+            "symbol": sym,
+            "baseAsset": base,
+            "quoteAsset": quote,
+            "status": status or "UNKNOWN",
+            "tickSize": filt["tickSize"],
+            "stepSize": filt["stepSize"],
+            "minQty": filt["minQty"],
+            "minNotional": filt["minNotional"],
+        })
+
+    # fallback to OpenAPI if empty
+    if not syms:
+        syms, ticks, raw = fallback_from_openapi_symbols(quote_filter or "USDT")
+
+    # final fallback to ticker/price
+    if not syms:
+        syms, ticks, raw = fallback_from_ticker_price(quote_filter or "USDT")
+
+    return sorted(set(syms)), ticks, raw
+
+# ---------- data ----------
+def fetch_klines(symbol, interval=INTERVAL, limit=LIMIT):
+    url = f"{BASE_V3}/api/v3/klines"
+    p = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = SES.get(url, params=p, timeout=25)
+    if r.status_code != 200:
+        p["interval"] = "Hour4"  # fallback alias seen on some gateways
+        r = SES.get(url, params=p, timeout=25)
+    r.raise_for_status()
+    rows = r.json()
+    if not rows or len(rows[0]) < 6:
+        return None
+    cols = ["t","o","h","l","c","v","ct","qv","n","tb","tqv","i"]
+    df = pd.DataFrame(rows, columns=cols[:len(rows[0])])
+    for col in ["o","h","l","c","v"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
 # ---------- core scan ----------
 def find_hits(df, tick, sym=None):
     if df is None or len(df) < max(N_LIST) + 2:
         return []
     n = len(df); last = n - 1
-
-    # only iterate the last ~30 days (180 candles)
     start_i = max(0, last - CANDLE_WINDOW + 1)
 
     o = df["o"].to_numpy(dtype=float)
@@ -174,12 +271,10 @@ def find_hits(df, tick, sym=None):
     l = df["l"].to_numpy(dtype=float)
     c = df["c"].to_numpy(dtype=float)
 
-    # green full-body
     rng = np.maximum(h - l, 1e-12)
     br = np.abs(c - o) / rng
     green_full = (c > o) & (br >= BODY_RATIO)
 
-    # quantize on tick grid
     ot = ticks_round(o, tick)
     ct = ticks_round(c, tick)
     ht = ticks_ceil(h, tick)
@@ -191,7 +286,6 @@ def find_hits(df, tick, sym=None):
         for nlook in N_LIST
     }
 
-    # precompute future extremes for "all" mode
     if UNTOUCHED_MODE == "all":
         fut_max = np.empty(n, dtype=np.int64); fut_min = np.empty(n, dtype=np.int64)
         fut_max[last] = -10**18; fut_min[last] = 10**18
@@ -210,7 +304,6 @@ def find_hits(df, tick, sym=None):
             dbg(sym, i, "reject bottom_wick", bwt)
             continue
 
-        # breakout vs prior highs (strict > on tick grid)
         broke, used_n = False, None
         for nlook in N_LIST:
             ph = prior_highs_ticks[nlook][i]
@@ -224,21 +317,13 @@ def find_hits(df, tick, sym=None):
         # untouched rule
         if UNTOUCHED_MODE == "next":
             if i < last and (ht[i+1] >= ht[i] or lt[i+1] <= lt[i]):
-                dbg(sym, i, "reject next_touched")
-                continue
-
+                dbg(sym, i, "reject next_touched"); continue
         elif UNTOUCHED_MODE == "next_low":
-            # protect only the low; high may be taken by the next candle
-            if i < last and (lt[i+1] <= lt[i]):   # equal counts as touch
-                dbg(sym, i, "reject next_low_touched")
-                continue
-
+            if i < last and (lt[i+1] <= lt[i]):
+                dbg(sym, i, "reject next_low_touched"); continue
         elif UNTOUCHED_MODE == "all":
             if fut_max[i] >= ht[i] or fut_min[i] <= lt[i]:
-                dbg(sym, i, "reject any_future_touch")
-                continue
-
-        # "none": no untouched constraint
+                dbg(sym, i, "reject any_future_touch"); continue
 
         hits.append((i, used_n, bwt))
         dbg(sym, i, "ACCEPT", "N", used_n, "bwt", bwt)
@@ -280,16 +365,13 @@ def run_all(symbols, tick_map):
             if res:
                 rows.extend(res)
 
-    # sort by freshness, then body size, then symbol
     rows.sort(key=lambda r: (r["candles_ago"], -r["body"], r["symbol"]))
 
     if LATEST_PER_SYMBOL:
         seen, dedup = set(), []
         for r in rows:
-            if r["symbol"] in seen:
-                continue
-            seen.add(r["symbol"])
-            dedup.append(r)
+            if r["symbol"] in seen: continue
+            seen.add(r["symbol"]); dedup.append(r)
         rows = dedup
 
     return rows
@@ -297,7 +379,9 @@ def run_all(symbols, tick_map):
 # ---------- export ----------
 def export_universe(raw_symbols, csv_path):
     df = pd.DataFrame(raw_symbols)
-    df = df.sort_values(["quoteAsset","baseAsset","symbol"], ascending=[True, True, True])
+    sort_cols = [c for c in ["quoteAsset","baseAsset","symbol"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[True]*len(sort_cols))
     df.to_csv(csv_path, index=False)
     print(f"exported {len(df)} assets to {csv_path}")
 
@@ -314,7 +398,6 @@ def explain_symbol(symbol: str, bars: int = 10, n_list=(15,20)):
     l = df["l"].to_numpy(float); c = df["c"].to_numpy(float)
     ts = df["t"].to_numpy(int)
 
-    # quantize
     ot = ticks_round(o, tick); ct = ticks_round(c, tick)
     ht = ticks_ceil(h, tick);  lt = ticks_floor(l, tick)
 
@@ -343,13 +426,10 @@ def main():
     global UNTOUCHED_MODE, CANDLE_WINDOW, VERBOSE, WATCH, LATEST_PER_SYMBOL
 
     ap = argparse.ArgumentParser(description="MEXC 4H pump scanner and universe exporter")
-
     ap.add_argument("--dump-universe", metavar="CSV_PATH",
                     help="export current MEXC spot universe to CSV")
     ap.add_argument("--include-all-quotes", action="store_true",
                     help="include all quote assets (default USDT only)")
-
-    # use None defaults; apply globals after parse to avoid 'used prior to global' error
     ap.add_argument("--untouched", choices=["next_low","next","all","none"], default=None,
                     help="untouched rule mode (default = current global)")
     ap.add_argument("--window", type=int, default=None,
@@ -362,10 +442,8 @@ def main():
                     help="print detailed metrics for a symbol and exit")
     ap.add_argument("--bars", type=int, default=10,
                     help="bars to print in --explain")
-
     args = ap.parse_args()
 
-    # apply CLI overrides to globals
     if args.untouched is not None:
         UNTOUCHED_MODE = args.untouched
     if args.window is not None:
@@ -383,6 +461,8 @@ def main():
         quote_filter="USDT",
         include_all_quotes=args.include_all_quotes
     )
+
+    print(f"# universe symbols={len(symbols)}")  # small visibility
 
     if args.dump_universe:
         export_universe(raw, args.dump_universe)
