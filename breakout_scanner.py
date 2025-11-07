@@ -17,8 +17,8 @@ INTERVAL       = "4h"
 N_LIST         = [15, 20]
 SEARCH_WINDOW  = 300
 BODY_RATIO     = 0.7
-LOWER_WICK_MAX_PCT = 0.005       # 0.2% of range, but will allow up to 2 ticks
-LIMIT          = 500
+LOWER_WICK_MAX_PCT = 0.004       # 0.2% of range, but will allow up to 2 ticks
+LIMIT          = 50
 MAX_WORKERS    = 10
 FALLBACK_TICK  = 1e-8            # if exchangeInfo missing
 
