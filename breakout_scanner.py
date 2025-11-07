@@ -1,7 +1,6 @@
 # Pump strategy scanner — MEXC Spot USDT — 4h only
-# Report ANY candle in the last SEARCH_WINDOW bars that:
-#   - is green and full-body with body ratio >= 0.7
-#   - CLOSE > max(high of previous N bars), N in {15, 20}
+# any candle in last SEARCH_WINDOW bars that is:
+#   green full-body (body >= 0.7) AND close > max(high of previous N), N in {15, 20}
 
 import requests
 import pandas as pd
@@ -12,29 +11,33 @@ from datetime import datetime, timezone
 BASE = "https://api.mexc.com"
 USDT_ONLY = True
 
-INTERVAL = "4h"           # only 4h
-N_LIST = [15, 20]         # lookback choices
-SEARCH_WINDOW = 60        # how many recent candles to report
+INTERVAL = "4h"
+N_LIST = [15, 20]
+SEARCH_WINDOW = 120          # recent window to report
 
-BODY_RATIO = 0.7          # full-body threshold for 4h
-EPS_PCT = 0.001           # 0.1% tolerance for close > prior high
+BODY_RATIO = 0.7             # full-body threshold
+EPS_PCT = 0.001              # 0.1% tolerance
 
 LIMIT = 300
 MAX_WORKERS = 8
 
 def get_symbols():
+    """Fetch MEXC spot symbols reliably  no Binance-only flags."""
     r = requests.get(f"{BASE}/api/v3/exchangeInfo", timeout=25)
     r.raise_for_status()
     out = []
     for s in r.json().get("symbols", []):
-        if s.get("status") != "TRADING":
-            continue
-        if s.get("spotTradingAllowed") is not True:
+        status = str(s.get("status", "")).upper()
+        if status not in ("TRADING", "ENABLED", "ONLINE"):
             continue
         sym = s.get("symbol", "")
         if USDT_ONLY and not sym.endswith("USDT"):
             continue
-        if any(x in sym for x in ["3L","3S","5L","5S"]):
+        # skip leveraged or synthetic names
+        if any(x in sym for x in ["3L","3S","5L","5S","UP","DOWN","BULL","BEAR"]):
+            continue
+        perms = s.get("permissions") or s.get("permission") or []
+        if perms and "SPOT" not in perms:
             continue
         out.append(sym)
     return sorted(set(out))
@@ -44,7 +47,7 @@ def fetch_klines(symbol, interval=INTERVAL, limit=LIMIT):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
-        params["interval"] = "Hour4"  # MEXC alt name
+        params["interval"] = "Hour4"  # MEXC alt
         r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
     rows = r.json()
@@ -63,14 +66,8 @@ def body_ratio(o, h, l, c):
     return abs(c - o) / rng
 
 def find_breakouts_4h(df):
-    """
-    returns list of tuples (idx, n_used) for ANY qualifying candle within last SEARCH_WINDOW
-    """
-    if df is None:
+    if df is None or len(df) < max(N_LIST) + 2:
         return []
-    if len(df) < max(N_LIST) + 2:
-        return []
-
     o = df["o"].to_numpy(float)
     h = df["h"].to_numpy(float)
     l = df["l"].to_numpy(float)
@@ -84,14 +81,15 @@ def find_breakouts_4h(df):
 
     results = []
     for n in N_LIST:
-        # prior high of previous n candles for each i
+        # prior high over previous n bars
         prior_high = pd.Series(h).rolling(n).max().shift(1).to_numpy()
-        eps = np.maximum(np.abs(prior_high) * EPS_PCT, 1e-12)
-        cond = green_full & (c > (prior_high + eps))
+        # tolerate tiny rounding by allowing close >= prior_high * (1 - eps)
+        thresh = np.maximum(prior_high * (1 - EPS_PCT), prior_high - 1e-12)
+        cond = green_full & (c >= thresh)
 
         idxs = np.where(cond)[0]
         for i in idxs:
-            if i >= window_start:  # only report recent ones
+            if i >= window_start:
                 results.append((i, n))
 
     # dedupe per index prefer larger N
