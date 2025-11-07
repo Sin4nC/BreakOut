@@ -1,9 +1,9 @@
-# MEXC Spot USDT — 4H Pump Scanner (strict: no bottom wick, no failed low break)
+# MEXC Spot USDT — 4H Pump Scanner (strict: minimal bottom wick, no failed low break)
 # Finds any 4H candle in a recent window that:
 # 1) is green full-body: body_ratio >= BODY_RATIO
 # 2) close > max(high of previous N), N in N_LIST
 # 3) AFTER that candle, no later candle breaks its low (no failed pullback: smin[i] > l[i])
-# 4) ~no bottom shadow: (open - low) <= LOWER_WICK_MAX_PCT * (high - low)
+# 4) minimal bottom shadow: (open - low) <= LOWER_WICK_MAX_PCT * (high - low)
 # Universe: spot USDT tickers (excludes 3L/3S/5L/5S/UP/DOWN/BULL/BEAR)
 import requests
 import pandas as pd
@@ -15,7 +15,7 @@ INTERVAL = "4h"
 N_LIST = [15, 20]
 SEARCH_WINDOW = 300 # how many recent 4H candles to scan
 BODY_RATIO = 0.7
-LOWER_WICK_MAX_PCT = 0.05 # Increased to match charts (small wick ok)
+LOWER_WICK_MAX_PCT = 0.1 # Increased to 10% to match real charts
 EPS = 1e-12
 LIMIT = 500
 MAX_WORKERS = 10
@@ -67,7 +67,7 @@ def find_hits_strict(df):
     rng = np.maximum(h - l, EPS)
     br = np.abs(c - o) / rng
     green_full = (c > o) & (br >= BODY_RATIO)
-    # "almost no bottom wick" on a green candle: open ~ low
+    # "minimal bottom wick" on a green candle: open ~ low
     bottom_wick_ok = (o - l) <= (LOWER_WICK_MAX_PCT * rng + 1e-15)
     highs_series = pd.Series(h)
     prior_highs = {nlook: highs_series.rolling(nlook).max().shift(1).to_numpy()
@@ -79,7 +79,9 @@ def find_hits_strict(df):
         smin[i] = min(l[i+1], smin[i+1])
     hits = []
     for i in range(start_i, n):
-        if not (green_full[i] and bottom_wick_ok[i]):
+        if not green_full[i]:
+            continue
+        if not bottom_wick_ok[i]:
             continue
         # breakout condition for any lookback in N_LIST
         ok_break = False
@@ -89,6 +91,7 @@ def find_hits_strict(df):
             if np.isfinite(ph) and c[i] > ph + EPS:
                 ok_break = True
                 used_n = nlook
+                break  # earliest N
         if not ok_break:
             continue
         # No failed: no future low <= this low
@@ -103,6 +106,8 @@ def scan_symbol(sym):
         df = fetch_klines(sym)
         found = find_hits_strict(df)
         if not found:
+            # Debug
+            print(f"DEBUG {sym}: No hits. Last body={body_ratio(df.iloc[-1]['o'], df.iloc[-1]['h'], df.iloc[-1]['l'], df.iloc[-1]['c']):.3f}, wick_pct={(df.iloc[-1]['o'] - df.iloc[-1]['l']) / rng[-1] if rng[-1] > 0 else 1:.3f}")
             return []
         last_idx = len(df) - 1
         out = []
