@@ -1,6 +1,6 @@
 # Breakout scanner for MEXC USDT spot pairs
-# Rule: FIRST full-body breakout above the highs of the last 20 candles
-# 4h body ratio = 0.7, 1d/1w = 0.6
+# Rule: FIRST full-body candle whose CLOSE is above the max high of the last 20 candles
+# Body ratio per interval: 4h=0.7  1d=0.6  1w=0.6
 
 import requests
 import pandas as pd
@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 BASE = "https://api.mexc.com"
 USDT_ONLY = True
 
-INTERVALS = ["4h", "1d", "1w"]   # you can set ["4h"] if you want only 4H
+INTERVALS = ["4h", "1d", "1w"]   # for quick testing you can use ["4h"]
 
-N_LOOKBACK = 20                  # prior-high window
-SEARCH_WINDOW = 60               # scan recent candles so we dont miss earlier signals
+N_LOOKBACK = 20
+SEARCH_WINDOW = 60
 
 BODY_RATIO_BY_INTERVAL = {
     "4h": 0.7,
@@ -23,6 +23,10 @@ BODY_RATIO_BY_INTERVAL = {
 
 LIMIT = 300
 MAX_WORKERS = 6
+
+# optional focus and debug
+WATCHLIST = []                  # e.g. ["AIAUSDT", "HIPPOUSDT"] to test only these
+DEBUG_SYMBOLS = []              # e.g. ["AIAUSDT"] to print near-miss reasons
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/exchangeInfo", timeout=20)
@@ -60,32 +64,37 @@ def fetch_klines(symbol, interval, limit=LIMIT):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
-def is_full_body(o, h, l, c, min_ratio):
+def body_ratio(o, h, l, c):
     rng = h - l
     if rng <= 0:
-        return False
-    body = abs(c - o)
-    return (body / rng) >= min_ratio
+        return 0.0
+    return abs(c - o) / rng
 
-def qualifies(df, i, min_ratio, n_lookback):
-    """does candle i qualify as full-body breakout with CLOSE above prior high"""
+def qualifies_close_break(df, i, min_ratio, n_lookback):
     o, h, l, c = df.iloc[i][["o","h","l","c"]]
     prior_high = df["h"].iloc[i - n_lookback : i].max()
-    return is_full_body(o, h, l, c, min_ratio) and (c > prior_high)
+    return (body_ratio(o, h, l, c) >= min_ratio) and (c > prior_high)
 
-def breakout_index(df, interval):
+def breakout_index(df, interval, symbol=None):
     if df is None or len(df) < N_LOOKBACK + 2:
         return None
     min_ratio = BODY_RATIO_BY_INTERVAL.get(interval, 0.6)
     start = max(N_LOOKBACK + 1, len(df) - SEARCH_WINDOW)
+
+    dbg = symbol in DEBUG_SYMBOLS
+
+    # scan older -> newer to return the FIRST breakout in the window
     for i in range(start, len(df)):
-        # current candle must qualify
-        if not qualifies(df, i, min_ratio, N_LOOKBACK):
-            continue
-        # previous candle must NOT qualify  so this is the FIRST full-body breakout
-        if qualifies(df, i-1, min_ratio, N_LOOKBACK):
-            continue
-        return i
+        ok_now = qualifies_close_break(df, i,   min_ratio, N_LOOKBACK)
+        ok_prev= qualifies_close_break(df, i-1, min_ratio, N_LOOKBACK)
+        if dbg:
+            if not ok_now:
+                o,h,l,c = df.iloc[i][["o","h","l","c"]]
+                ph = df["h"].iloc[i - N_LOOKBACK : i].max()
+                print(f"DEBUG {symbol} {interval} i={i} body={body_ratio(o,h,l,c):.3f} "
+                      f"need>={min_ratio} close={c:.6g} prior_high={ph:.6g}")
+        if ok_now and not ok_prev:
+            return i
     return None
 
 def human_time(ms):
@@ -96,7 +105,7 @@ def scan_symbol(sym):
     for itv in INTERVALS:
         try:
             df = fetch_klines(sym, itv)
-            idx = breakout_index(df, itv)
+            idx = breakout_index(df, itv, sym)
             if idx is not None:
                 row = df.iloc[idx]
                 alerts.append(
@@ -116,7 +125,7 @@ def run_round(symbols):
     return found
 
 if __name__ == "__main__":
-    symbols = get_symbols()
+    symbols = WATCHLIST if WATCHLIST else get_symbols()
     hits = run_round(symbols)
     if hits:
         for h in hits:
