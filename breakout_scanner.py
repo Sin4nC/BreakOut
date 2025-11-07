@@ -1,6 +1,7 @@
-# Pump strategy scanner for MEXC USDT spot pairs
-# Detect FIRST green full-body candle whose CLOSE breaks above max high of last N candles (N in {15,20})
-# Scans entire series to find the first breakout, then reports if it occurred within SEARCH_WINDOW candles
+# Pump strategy scanner — MEXC Spot USDT — 4h only
+# Report ANY candle in the last SEARCH_WINDOW bars that:
+#   - is green and full-body with body ratio >= 0.7
+#   - CLOSE > max(high of previous N bars), N in {15, 20}
 
 import requests
 import pandas as pd
@@ -11,17 +12,15 @@ from datetime import datetime, timezone
 BASE = "https://api.mexc.com"
 USDT_ONLY = True
 
-INTERVALS = ["4h", "1d", "1w"]
-N_LIST = [15, 20]
-SEARCH_WINDOW = 60
+INTERVAL = "4h"           # only 4h
+N_LIST = [15, 20]         # lookback choices
+SEARCH_WINDOW = 60        # how many recent candles to report
 
-BODY_RATIO_BY_INTERVAL = {"4h": 0.7, "1d": 0.6, "1w": 0.6}
-EPS_PCT = 0.001  # 0.1% tolerance for close > prior_high
+BODY_RATIO = 0.7          # full-body threshold for 4h
+EPS_PCT = 0.001           # 0.1% tolerance for close > prior high
 
 LIMIT = 300
 MAX_WORKERS = 8
-
-DEBUG_SYMBOLS = []  # e.g. ["HIPPOUSDT","AIAUSDT"] to print debug while scanning ALL symbols
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/exchangeInfo", timeout=25)
@@ -40,15 +39,13 @@ def get_symbols():
         out.append(sym)
     return sorted(set(out))
 
-def fetch_klines(symbol, interval, limit=LIMIT):
+def fetch_klines(symbol, interval=INTERVAL, limit=LIMIT):
     url = f"{BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
-        alt = {"4h": "Hour4", "1d": "Day1", "1w": "Week1"}.get(interval)
-        if alt:
-            params["interval"] = alt
-            r = requests.get(url, params=params, timeout=25)
+        params["interval"] = "Hour4"  # MEXC alt name
+        r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
     rows = r.json()
     if not rows or len(rows[0]) < 6:
@@ -65,78 +62,65 @@ def body_ratio(o, h, l, c):
         return 0.0
     return abs(c - o) / rng
 
-def first_breakouts(df, interval):
-    """return list of (idx, n_used) for FIRST breakouts in whole series"""
+def find_breakouts_4h(df):
+    """
+    returns list of tuples (idx, n_used) for ANY qualifying candle within last SEARCH_WINDOW
+    """
     if df is None:
         return []
-    min_ratio = BODY_RATIO_BY_INTERVAL.get(interval, 0.6)
-    nmax = max(N_LIST)
-    if len(df) < nmax + 2:
+    if len(df) < max(N_LIST) + 2:
         return []
+
     o = df["o"].to_numpy(float)
     h = df["h"].to_numpy(float)
     l = df["l"].to_numpy(float)
     c = df["c"].to_numpy(float)
+
     br = np.divide(np.abs(c - o), np.maximum(h - l, 1e-12))
-    green_full = (c > o) & (br >= min_ratio)
+    green_full = (c > o) & (br >= BODY_RATIO)
 
-    out = []
+    last_idx = len(df) - 1
+    window_start = max(0, last_idx - SEARCH_WINDOW + 1)
+
+    results = []
     for n in N_LIST:
-        # rolling max of highs over previous n bars
-        ph = pd.Series(h).rolling(n, min_periods=n).max().shift(0).to_numpy()
-        # prior highs aligned so that ph[i-1] is max over bars [i-n, i-1]
-        # we want close[i] > max(high[i-n : i-1])
-        ph_now  = np.concatenate(([np.nan], pd.Series(h).rolling(n).max().shift(1).to_numpy()[1:]))
-        ph_prev = np.concatenate(([np.nan], pd.Series(h).rolling(n).max().shift(1).to_numpy()[1:]))  # same window for i-1
+        # prior high of previous n candles for each i
+        prior_high = pd.Series(h).rolling(n).max().shift(1).to_numpy()
+        eps = np.maximum(np.abs(prior_high) * EPS_PCT, 1e-12)
+        cond = green_full & (c > (prior_high + eps))
 
-        # due to shift trick above, compute directly for clarity
-        ph_now  = pd.Series(h).shift(1).rolling(n).max().to_numpy()
-        ph_prev = pd.Series(h).shift(2).rolling(n).max().to_numpy()
-
-        eps = np.maximum(np.abs(ph_now) * EPS_PCT, 1e-12)
-        cond_now  = green_full & (c > (ph_now + eps))
-        cond_prev = (np.roll(green_full, 1)) & (np.roll(c, 1) > (ph_prev + np.maximum(np.abs(ph_prev)*EPS_PCT, 1e-12)))
-
-        # first breakout = qualifies now AND not qualified on previous bar
-        first = cond_now & (~cond_prev)
-
-        idxs = np.where(first)[0]
+        idxs = np.where(cond)[0]
         for i in idxs:
-            if i >= n:  # ensure window exists
-                out.append((i, n))
-    # keep unique indices preferring larger N (20 over 15) by sorting
-    out.sort(key=lambda x: (x[0], -x[1]))
-    uniq = {}
-    for i, n in out:
-        if i not in uniq:
-            uniq[i] = n
-    return [(i, uniq[i]) for i in sorted(uniq.keys())]
+            if i >= window_start:  # only report recent ones
+                results.append((i, n))
+
+    # dedupe per index prefer larger N
+    results.sort(key=lambda x: (x[0], -x[1]))
+    seen = {}
+    for i, n in results:
+        if i not in seen:
+            seen[i] = n
+    return [(i, seen[i]) for i in sorted(seen.keys())]
 
 def human_time(ms):
     return datetime.fromtimestamp(int(ms)//1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 def scan_symbol(sym):
     alerts = []
-    for itv in INTERVALS:
-        try:
-            df = fetch_klines(sym, itv)
-            hits = first_breakouts(df, itv)
-            if not hits:
-                if sym in DEBUG_SYMBOLS and df is not None and len(df) > 0:
-                    last = df.iloc[-1]
-                    print(f"DEBUG {sym} {itv} last close {last['c']:.6g}")
-                continue
-            last_idx = len(df) - 1
-            for i, n_used in hits:
-                if i >= last_idx - SEARCH_WINDOW + 1:
-                    row = df.iloc[i]
-                    candles_ago = last_idx - i
-                    alerts.append(
-                        f"{sym} {itv} PUMP n={n_used} candles_ago={candles_ago} "
-                        f"time {human_time(row['t'])} close {row['c']:.6g} body {body_ratio(row['o'],row['h'],row['l'],row['c']):.2f}"
-                    )
-        except Exception:
-            pass
+    try:
+        df = fetch_klines(sym, INTERVAL)
+        hits = find_breakouts_4h(df)
+        last_idx = len(df) - 1 if df is not None else -1
+        for i, n_used in hits:
+            row = df.iloc[i]
+            candles_ago = last_idx - i
+            alerts.append(
+                f"{sym} 4h PUMP n={n_used} candles_ago={candles_ago} "
+                f"time {human_time(row['t'])} close {row['c']:.6g} "
+                f"body {body_ratio(row['o'],row['h'],row['l'],row['c']):.2f}"
+            )
+    except Exception:
+        pass
     return alerts
 
 def run_round(symbols):
