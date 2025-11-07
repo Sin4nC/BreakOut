@@ -1,9 +1,10 @@
-# MEXC Spot USDT — 4H Pump Scanner (strict untouched rule)
+# MEXC Spot USDT — 4H Pump Scanner (strict untouched rule, English-only)
 # Rules:
-# 1) last 4H window scan: green full-body (body_ratio >= 0.7)
-# 2) close > max(high of previous N), with N in {15, 20}
-# 3) AFTER that candle: for all future candles j>i -> high[j] < high[i] AND low[j] > low[i]
-# Only SPOT USDT pairs; exclude leveraged-style tickers
+# 1) green full-body: body_ratio >= 0.7
+# 2) close > max(high of previous N), N in {15, 20}
+# 3) AFTER that candle, for all future candles j>i:
+#       high[j] < high[i]  AND  low[j] > low[i]
+# Universe: spot USDT tickers, excluding leveraged-style symbols
 
 import requests
 import pandas as pd
@@ -15,7 +16,7 @@ BASE = "https://api.mexc.com"
 
 INTERVAL      = "4h"
 N_LIST        = [15, 20]
-SEARCH_WINDOW = 300          # چند صد کندل آخر را میگردد (می‌توانی کم/زیاد کنی)
+SEARCH_WINDOW = 300
 BODY_RATIO    = 0.7
 EPS           = 1e-9
 LIMIT         = 500
@@ -73,16 +74,15 @@ def find_hits_strict(df):
     br  = np.abs(c - o) / rng
     green_full = (c > o) & (br >= BODY_RATIO)
 
-    # rolling prior highs for all N values
+    # rolling highs for both lookbacks
     highs_series = pd.Series(h)
     prior_highs = {n: highs_series.rolling(n).max().shift(1).to_numpy() for n in N_LIST}
 
-    # precompute suffix max/min for untouched rule
-    # smax[i] = max(h[i+1:]), smin[i] = min(l[i+1:])
+    # suffix max/min for untouched rule
     smax = np.empty(n, dtype=float)
     smin = np.empty(n, dtype=float)
     smax[last_idx] = -np.inf
-    smin[last_idx] = np.inf
+    smin[last_idx] =  np.inf
     for i in range(n-2, -1, -1):
         smax[i] = max(h[i+1], smax[i+1])
         smin[i] = min(l[i+1], smin[i+1])
@@ -92,21 +92,20 @@ def find_hits_strict(df):
         if not green_full[i]:
             continue
 
-        # breakout for any N
         ok_break = False
         used_n = None
         for nlook in N_LIST:
             ph = prior_highs[nlook][i]
             if np.isfinite(ph) and c[i] > ph + EPS:
                 ok_break = True
-                used_n = nlook  # (اگر هر دو برقرار شد مهم نیست کدام را گزارش دهیم)
+                used_n = nlook
         if not ok_break:
             continue
 
-        # strict untouched afterwards: nobody took out its high or low
-        if smax[i] >= h[i] - EPS:  # آینده سقف را زده
+        # strict untouched afterwards
+        if smax[i] >= h[i] - EPS:
             continue
-        if smin[i] <= l[i] + EPS:  # آینده کف را زده
+        if smin[i] <= l[i] + EPS:
             continue
 
         hits.append((i, used_n))
@@ -146,8 +145,7 @@ def run_all(symbols):
         for lst in ex.map(scan_symbol, symbols):
             if lst:
                 rows.extend(lst)
-    # recent first
-    rows.sort(key=lambda r: r["candles_ago"])
+    rows.sort(key=lambda r: r["candles_ago"])  # most recent first
     return rows
 
 if __name__ == "__main__":
