@@ -1,0 +1,21 @@
+name: scan
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: run scanner
+        run: |
+          python breakout_scanner.py | tee output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-log
+          path: output.txt
