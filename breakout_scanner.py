@@ -1,4 +1,4 @@
-# MEXC Spot USDT — 4H Pump Scanner (strict: minimal bottom wick, no failed low break)
+# MEXC Spot USDT — 4H Pump Scanner (relaxed: minimal bottom wick, no failed low break)
 # Finds any 4H candle in a recent window that:
 # 1) is green full-body: body_ratio >= BODY_RATIO
 # 2) close > max(high of previous N), N in N_LIST
@@ -14,8 +14,8 @@ BASE = "https://api.mexc.com"
 INTERVAL = "4h"
 N_LIST = [15, 20]
 SEARCH_WINDOW = 300 # how many recent 4H candles to scan
-BODY_RATIO = 0.6 # Lowered to match real candles
-LOWER_WICK_MAX_PCT = 0.3 # Increased to 30% to match charts with small wicks
+BODY_RATIO = 0.6 # Relaxed from 0.7
+LOWER_WICK_MAX_PCT = 0.3 # Relaxed from 0.002 to allow small wicks like in charts
 EPS = 1e-12
 LIMIT = 500
 MAX_WORKERS = 10
