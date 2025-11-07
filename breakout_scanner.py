@@ -1,12 +1,14 @@
+# breakout_scanner.py
 # MEXC Spot USDT — 4H Pump Scanner + Universe Export
 # Exact rules:
 # 1) timeframe 4H
 # 2) green full-body: body_ratio >= 0.7
 # 3) close > max(high of previous 15 or 20 candles)
 # 4) bottom wick <= 1 tick (on the tick grid)
-# 5) untouched: ONLY the NEXT candle's LOW must NOT touch or break the signal's LOW  (next_low)
+# 5) untouched: ONLY the NEXT candle's LOW must NOT touch/break the signal's LOW  (next_low)
 
-import argparse, requests, pandas as pd, numpy as np, concurrent.futures as fut
+import argparse
+import requests, pandas as pd, numpy as np, concurrent.futures as fut
 from math import ceil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -226,7 +228,7 @@ def find_hits(df, tick, sym=None):
                 continue
 
         elif UNTOUCHED_MODE == "next_low":
-            # NEW: protect only the low; high may be taken by the next candle
+            # protect only the low; high may be taken by the next candle
             if i < last and (lt[i+1] <= lt[i]):   # equal counts as touch
                 dbg(sym, i, "reject next_low_touched")
                 continue
@@ -337,24 +339,39 @@ def explain_symbol(symbol: str, bars: int = 10, n_list=(15,20)):
 
 # ---------- CLI ----------
 def main():
+    # declare globals first
+    global UNTOUCHED_MODE, CANDLE_WINDOW, VERBOSE, WATCH, LATEST_PER_SYMBOL
+
     ap = argparse.ArgumentParser(description="MEXC 4H pump scanner and universe exporter")
-    ap.add_argument("--dump-universe", metavar="CSV_PATH", help="export current MEXC spot universe to CSV")
-    ap.add_argument("--include-all-quotes", action="store_true", help="include all quote assets (default USDT only)")
-    ap.add_argument("--untouched", choices=["next_low","next","all","none"],
-                    default=UNTOUCHED_MODE, help="untouched rule mode")
-    ap.add_argument("--window", type=int, default=CANDLE_WINDOW, help="scan window in candles (default 180)")
+
+    ap.add_argument("--dump-universe", metavar="CSV_PATH",
+                    help="export current MEXC spot universe to CSV")
+    ap.add_argument("--include-all-quotes", action="store_true",
+                    help="include all quote assets (default USDT only)")
+
+    # use None defaults; apply globals after parse to avoid 'used prior to global' error
+    ap.add_argument("--untouched", choices=["next_low","next","all","none"], default=None,
+                    help="untouched rule mode (default = current global)")
+    ap.add_argument("--window", type=int, default=None,
+                    help="scan window in candles (default = current global, typically 180)")
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--watch", type=str, default="", help="comma-separated symbols to print reasons for")
+    ap.add_argument("--watch", type=str, default="",
+                    help="comma-separated symbols to print reasons for")
     ap.add_argument("--unique-per-symbol", action="store_true")
-    ap.add_argument("--explain", type=str, default="", help="print detailed metrics for a symbol and exit")
-    ap.add_argument("--bars", type=int, default=10, help="bars to print in --explain")
+    ap.add_argument("--explain", type=str, default="",
+                    help="print detailed metrics for a symbol and exit")
+    ap.add_argument("--bars", type=int, default=10,
+                    help="bars to print in --explain")
+
     args = ap.parse_args()
 
-    global UNTOUCHED_MODE, CANDLE_WINDOW, VERBOSE, WATCH, LATEST_PER_SYMBOL
-    UNTOUCHED_MODE = args.untouched
-    CANDLE_WINDOW = int(args.window)
+    # apply CLI overrides to globals
+    if args.untouched is not None:
+        UNTOUCHED_MODE = args.untouched
+    if args.window is not None:
+        CANDLE_WINDOW = int(args.window)
     VERBOSE = args.verbose
-    WATCH = set([s.strip().upper() for s in args.watch.split(",") if s.strip()])
+    WATCH = set(s.strip().upper() for s in args.watch.split(",") if s.strip())
     if args.unique_per_symbol:
         LATEST_PER_SYMBOL = True
 
