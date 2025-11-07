@@ -11,12 +11,12 @@ BASE = "https://api.mexc.com"
 USDT_ONLY = True
 INTERVAL = "4h"  # 4h only
 N_LIST = [15, 20]  # set to [20] if you want strictly 20
-SEARCH_WINDOW = 60  # recent window to report
+SEARCH_WINDOW = 120  # increased to catch older examples like early Nov
 BODY_RATIO = 0.7  # full-body threshold for 4h
 EPS_PCT = 0.001  # 0.1% tolerance to avoid rounding edge cases
 LIMIT = 300
 MAX_WORKERS = 8
-DEBUG_SYMBOLS = ["HIPPOUSDT", "AIAUSDT"]  # for debug printing, added AIAUSDT
+DEBUG_SYMBOLS = ["HIPPOUSDT", "AIAUSDT"]  # for extra debug
 
 def get_symbols():
     r = requests.get(f"{BASE}/api/v3/exchangeInfo", timeout=25)
@@ -42,7 +42,9 @@ def fetch_klines(symbol, interval=INTERVAL, limit=LIMIT):
     if r.status_code != 200:
         params["interval"] = "Hour4"  # MEXC alt name
         r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
+    if r.status_code != 200:
+        print(f"Error fetching {symbol}: {r.status_code}")
+        return None
     rows = r.json()
     if not rows or len(rows[0]) < 6:
         return None
@@ -93,14 +95,16 @@ def scan_symbol(sym):
     alerts = []
     try:
         df = fetch_klines(sym, INTERVAL)
+        if df is None:
+            print(f"DEBUG {sym}: No data fetched")
+            return alerts
         res = check_breakout_4h(df)
         if res is None:
-            if sym in DEBUG_SYMBOLS and df is not None and len(df) > 0:
-                i = len(df) - 1
-                row = df.iloc[i]
-                ph20 = pd.Series(df["h"]).shift(1).rolling(20).max().iloc[i]
-                print(f"DEBUG {sym} body={body_ratio(row['o'], row['h'], row['l'], row['c']):.3f} "
-                      f"close={row['c']:.6g} prior20={ph20:.6g}")
+            i = len(df) - 1
+            row = df.iloc[i]
+            ph20 = pd.Series(df["h"]).shift(1).rolling(20).max().iloc[i]
+            print(f"DEBUG {sym} last body={body_ratio(row['o'], row['h'], row['l'], row['c']):.3f} "
+                  f"close={row['c']:.6g} prior20={ph20:.6g} time={human_time(row['t'])}")
             return alerts
         
         last_idx = len(df) - 1
@@ -113,8 +117,8 @@ def scan_symbol(sym):
                     f"time {human_time(row['t'])} close {row['c']:.6g} "
                     f"body {body_ratio(row['o'], row['h'], row['l'], row['c']):.2f}"
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error scanning {sym}: {e}")
     return alerts
 
 def run_round(symbols):
@@ -126,10 +130,12 @@ def run_round(symbols):
     return found
 
 if __name__ == "__main__":
-    symbols = get_symbols()
+    # symbols = get_symbols()  # uncomment to scan all
+    symbols = ["HIPPOUSDT", "AIAUSDT"]  # limited for testing
+    print(f"Scanning {len(symbols)} symbols...")
     hits = run_round(symbols)
     if hits:
-        for h in sorted(hits):  # Sort for cleaner output
+        for h in sorted(hits):
             print(h)
     else:
         print("no signals")
