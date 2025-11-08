@@ -1,198 +1,216 @@
-# breakout_scanner.py
-# MEXC spot USDT breakout scanner — resilient symbol discovery
-import argparse, concurrent.futures as cf, datetime as dt, sys, time, math
-from typing import Dict, List, Tuple, Optional
+#!/usr/bin/env python3
+import argparse, sys, time, math, json, random, threading
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
-def fmt_time_utc(ms: int) -> str:
-    return dt.datetime.utcfromtimestamp(ms / 1000.0).strftime("%Y-%m-%d %H:%M UTC")
+# ---------- CLI ----------
+p = argparse.ArgumentParser()
+p.add_argument("--api", default="https://api.mexc.com", help="REST base url")
+p.add_argument("--interval", default="4h")
+p.add_argument("--window", type=int, default=45, help="lookback window candles to scan")
+p.add_argument("--lookbacks", default="10,15", help="breakout over max high of these N")
+p.add_argument("--min-body", type=float, default=0.70, help="full-body threshold [0..1]")
+p.add_argument("--untouched", choices=["none","next_low","all"], default="next_low",
+               help="low untouched rule after signal")
+p.add_argument("--max-candles-ago", type=int, default=180, help="freshness filter")
+p.add_argument("--target-pct", type=float, default=None, help="require target not hit yet")
+p.add_argument("--symbols-file", default=None, help="file with symbols one per line")
+p.add_argument("--workers", type=int, default=4, help="max concurrent symbol scans")
+p.add_argument("--sleep", type=float, default=0.25, help="sleep seconds before EACH HTTP call")
+p.add_argument("--max-retries", type=int, default=6, help="HTTP retry attempts for 429/5xx")
+p.add_argument("--universe-limit", type=int, default=None, help="cap number of symbols scanned")
+args = p.parse_args()
+lookbacks = [int(x) for x in args.lookbacks.split(",")]
 
-def get(session: requests.Session, url: str, **params):
-    r = session.get(url, params=params or None, timeout=30)
+# ---------- HTTP with throttle + backoff ----------
+http_lock = threading.Lock()
+session = requests.Session()
+session.headers.update({"User-Agent": "BreakOutScanner/1.0"})
+
+def get(url, **params):
+    # throttle
+    if args.sleep > 0:
+        time.sleep(args.sleep)
+    backoff = 0.5
+    for attempt in range(args.max_retries + 1):
+        r = session.get(url, params=params, timeout=20)
+        if r.status_code < 400:
+            return r
+        # retry for rate limit or transient
+        if r.status_code in (429, 500, 502, 503, 504):
+            ra = r.headers.get("Retry-After")
+            delay = float(ra) if ra else backoff * (2 ** attempt)
+            delay = min(delay, 8.0)  # cap
+            # jitter
+            delay = delay * (0.75 + 0.5*random.random())
+            time.sleep(delay)
+            continue
+        r.raise_for_status()
+    # last try failed
     r.raise_for_status()
-    return r
 
-def get_exchange_info(session: requests.Session, api: str) -> Dict:
-    return get(session, f"{api}/api/v3/exchangeInfo").json()
+# ---------- helpers ----------
+def to_utc(ts_ms):
+    return datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-def parse_symbols_from_exchange_info(ex_info: Dict) -> List[Dict]:
-    out = []
-    for s in ex_info.get("symbols", []):
-        symbol = s.get("symbol", "")
-        quote = s.get("quoteAsset", "")
-        status = s.get("status", "TRADING")
-        # شرط‌های مینیمال تا صفر نشود
-        if not symbol or quote != "USDT":
-            continue
-        if status not in ("TRADING", "ENABLED"):
-            continue
-        tick = 1e-06
-        for f in s.get("filters", []):
-            if f.get("filterType") in ("PRICE_FILTER", "PRICE_FILTER_1", "PRICE_FILTER_2"):
-                ts = f.get("tickSize")
-                if ts:
-                    try: tick = float(ts)
-                    except: pass
-        out.append({"symbol": symbol, "tick": tick})
-    return out
-
-def fallback_symbols_from_ticker(session: requests.Session, api: str) -> List[Dict]:
-    data = get(session, f"{api}/api/v3/ticker/price").json()
-    out = []
-    for row in data if isinstance(data, list) else []:
-        sym = row.get("symbol", "")
-        if sym.endswith("USDT"):
-            out.append({"symbol": sym, "tick": 1e-06})
-    return out
-
-def fallback_symbols_from_default(session: requests.Session, api: str) -> List[Dict]:
-    # این اندپوینت گاهی رشته کاما جدا می‌دهد
-    r = get(session, f"{api}/api/v3/defaultSymbols")
+def fetch_exchange_symbols(api):
     try:
-        payload = r.json()
-        if isinstance(payload, dict):
-            raw = payload.get("symbols", "")
-        elif isinstance(payload, list):
-            raw = ",".join(payload)
-        else:
-            raw = str(payload)
-    except ValueError:
-        raw = r.text
-    toks = [t.strip().upper().replace('"', '') for t in raw.replace("[","").replace("]","").split(",")]
-    out = []
-    for t in toks:
-        if t.endswith("USDT") and t:
-            out.append({"symbol": t, "tick": 1e-06})
-    return out
-
-def build_universe(session: requests.Session, api: str) -> List[Dict]:
-    # 1 exchangeInfo
-    try:
-        ex = get_exchange_info(session, api)
-        syms = parse_symbols_from_exchange_info(ex)
-        if syms:
-            sys.stderr.write(f"# universe source=exchangeInfo symbols={len(syms)}\n")
-            return syms
-        else:
-            sys.stderr.write("# exchangeInfo returned zero symbols for USDT, falling back\n")
-    except Exception as e:
-        sys.stderr.write(f"# exchangeInfo error {e}, falling back\n")
-
-    # 2 ticker/price
-    try:
-        syms = fallback_symbols_from_ticker(session, api)
-        if syms:
-            sys.stderr.write(f"# universe source=ticker/price symbols={len(syms)}\n")
-            return syms
-    except Exception as e:
-        sys.stderr.write(f"# ticker/price error {e}\n")
-
-    # 3 defaultSymbols
-    try:
-        syms = fallback_symbols_from_default(session, api)
-        sys.stderr.write(f"# universe source=defaultSymbols symbols={len(syms)}\n")
-        return syms
-    except Exception as e:
-        sys.stderr.write(f"# defaultSymbols error {e}\n")
+        data = get(f"{api}/api/v3/exchangeInfo").json()
+        syms = []
+        for s in data.get("symbols", []):
+            sym = s.get("symbol")
+            if not sym or not sym.endswith("USDT"): 
+                continue
+            st = s.get("status","TRADING")
+            if st != "TRADING": 
+                continue
+            syms.append(sym)
+        return sorted(set(syms))
+    except Exception:
         return []
 
-def body_ratio(o,h,l,c):
-    tr = max(h - l, 1e-12)
-    return (c - o) / tr if c > o else 0.0
+def fetch_ticker_symbols(api):
+    data = get(f"{api}/api/v3/ticker/price").json()
+    syms = [x["symbol"] for x in data if x["symbol"].endswith("USDT")]
+    return sorted(set(syms))
 
-def bottom_wick_ticks(o,l,tick,green):
-    if not green: return 0
-    return int(round(max(o - l, 0.0) / max(tick,1e-12)))
-
-def close_above_prev_highs(candles, idx, lookback, close_value):
-    start = max(0, idx - lookback)
-    prev_highs = [c[2] for c in candles[start:idx]]
-    return len(prev_highs) >= lookback and close_value > max(prev_highs)
-
-def untouched_ok(candles, idx, rule):
-    sig_h = candles[idx][2]; sig_l = candles[idx][3]
-    if rule == "none": return True
-    if idx + 1 >= len(candles): return True
-    if rule == "next_low":
-        return candles[idx+1][3] > sig_l
-    if rule == "all_low":
-        return all(c[3] > sig_l for c in candles[idx+1:])
-    if rule == "all_highlow":
-        return all((c[3] > sig_l and c[2] < sig_h) for c in candles[idx+1:])
-    return True
-
-def target_not_hit(candles, idx, target_pct, from_price=None):
-    if not target_pct or target_pct <= 0: return True
-    sig_close = candles[idx][4] if from_price is None else from_price
-    tgt = sig_close * (1 + target_pct)
-    return all(c[2] < tgt for c in candles[idx+1:])
-
-def get_klines(session, api, symbol, interval, limit):
-    data = get(session, f"{api}/api/v3/klines", symbol=symbol, interval=interval, limit=limit).json()
-    out=[]
-    for r in data:
-        o=float(r[1]); h=float(r[2]); l=float(r[3]); c=float(r[4])
-        ot=int(r[0]); ct=int(r[6])
-        out.append((ot,o,h,l,c,ct))
-    return out
-
-def scan_symbol(session, api, rec, interval, window, lookbacks, min_body, untouched_rule, max_candles_ago, target_pct):
-    sym = rec["symbol"]; tick = rec["tick"]
-    max_lb = max(lookbacks); limit = window + max_lb + 5
-    kl = get_klines(session, api, sym, interval, limit)
-    if len(kl) < max_lb + 2: return []
-    out=[]; last_idx=len(kl)-1; start_idx=max(0,last_idx - window + 1)
-    for j in range(start_idx, len(kl)):
-        ot,o,h,l,c,ct = kl[j]
-        if c <= o: continue
-        br = body_ratio(o,h,l,c)
-        if br < min_body: continue
-        n_used=None
-        for n in lookbacks:
-            if j-n < 0: continue
-            if close_above_prev_highs(kl, j, n, c):
-                n_used=n; break
-        if n_used is None: continue
-        if not untouched_ok(kl, j, untouched_rule): continue
-        if target_pct and not target_not_hit(kl, j, target_pct): continue
-        candles_ago = last_idx - j
-        if candles_ago > max_candles_ago: continue
-        bw = bottom_wick_ticks(o,l,tick,True)
-        out.append(f"{sym},{fmt_time_utc(ct)},{c:.15g},{br:.2f},{n_used},{h:.15g},{l:.15g},{bw},{tick:.15g},{candles_ago}")
-    return out
-
-def main():
-    ap = argparse.ArgumentParser(description="MEXC 4H breakout scanner")
-    ap.add_argument("--api", default="https://api.mexc.com", help="API base url")
-    ap.add_argument("--interval", default="4h")
-    ap.add_argument("--window", type=int, default=45)
-    ap.add_argument("--lookbacks", default="10,15")
-    ap.add_argument("--min-body", type=float, default=0.70)
-    ap.add_argument("--untouched", default="next_low", choices=["none","next_low","all_low","all_highlow"])
-    ap.add_argument("--max-candles-ago", type=int, default=45)
-    ap.add_argument("--target-pct", type=float, default=None)
-    ap.add_argument("--symbols-file", default=None)
-    ap.add_argument("--max-workers", type=int, default=10)
-    args = ap.parse_args()
-    lookbacks = sorted({int(x) for x in args.lookbacks.split(",") if x.strip()})
-    sess = requests.Session()
-
+def get_universe():
     if args.symbols_file:
         with open(args.symbols_file, "r", encoding="utf-8") as f:
-            syms=[{"symbol":ln.strip(),"tick":1e-06} for ln in f if ln.strip()]
-        sys.stderr.write(f"# universe source=file symbols={len(syms)}\n")
-    else:
-        syms = build_universe(sess, args.api)
+            syms = [ln.strip() for ln in f if ln.strip()]
+        print(f"# universe source=symbols_file symbols={len(syms)}", file=sys.stderr)
+        return syms
+    syms = fetch_exchange_symbols(args.api)
+    if not syms:
+        print("# exchangeInfo returned zero symbols for USDT, falling back", file=sys.stderr)
+        syms = fetch_ticker_symbols(args.api)
+        print(f"# universe source=ticker/price symbols={len(syms)}", file=sys.stderr)
+    if args.universe_limit:
+        syms = syms[:args.universe_limit]
+        print(f"# universe limited to {len(syms)}", file=sys.stderr)
+    return syms
 
+def get_klines(symbol, limit):
+    # MEXC v3 format like Binance
+    data = get(f"{args.api}/api/v3/klines", symbol=symbol, interval=args.interval, limit=limit).json()
+    # each item: [openTime, open, high, low, close, volume, closeTime, ...]
+    kl = []
+    for it in data:
+        o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
+        kl.append((int(it[0]), o, h, l, c, int(it[6])))
+    return kl
+
+def tick_from_price(p):
+    # try to guess a tick size from price magnitude
+    if p == 0: 
+        return 1e-6
+    s = f"{p:.12f}".rstrip("0")
+    if "." in s:
+        dec = len(s.split(".")[1])
+        return 10 ** (-min(dec, 6))
+    return 1e-6
+
+# ---------- strategy rules ----------
+def breakout_records(symbol):
+    limit = args.window + max(lookbacks) + 5  # history + a few after-candles
+    kl = get_klines(symbol, limit)
+    if len(kl) < (max(lookbacks) + 2):
+        return []
+
+    recs = []
+    # use only CLOSED candles (ignore the last if still open)
+    # in MEXC, last item is the just closed for 4h when requested slightly after
+    for idx in range(max(lookbacks)+1, len(kl)):
+        ts,o,h,l,c,cts = kl[idx]
+        rng = (h - l)
+        if rng <= 0: 
+            continue
+        body = (c - o) / rng
+        if c <= o: 
+            continue  # green full-body only
+        if body < args.min_body:
+            continue
+
+        # breakout over prior N highs
+        window_hi = [kl[idx-j-1][2] for j in range(max(lookbacks))]
+        ok_lb = []
+        for N in lookbacks:
+            prev_max = max(window_hi[:N])
+            if c > prev_max:
+                ok_lb.append(N)
+        if not ok_lb:
+            continue
+
+        # untouched rule
+        if args.untouched != "none":
+            sig_low = l
+            if args.untouched == "next_low":
+                if idx+1 < len(kl):
+                    next_low = kl[idx+1][3]
+                    if next_low <= sig_low:
+                        continue
+            elif args.untouched == "all":
+                good = True
+                for j in range(idx+1, len(kl)):
+                    if kl[j][3] <= sig_low:
+                        good = False; break
+                if not good:
+                    continue
+
+        # freshness
+        candles_ago = (len(kl)-1) - idx
+        if candles_ago > args.max_candles_ago:
+            continue
+
+        # target not hit yet
+        if args.target_pct is not None and idx+1 < len(kl):
+            tgt = c * (1 + args.target_pct)
+            high_after = max(kl[j][2] for j in range(idx+1, len(kl)))
+            if high_after >= tgt:
+                continue
+
+        # bottom wick ticks (reported only)
+        tick = tick_from_price(c)
+        bottom_wick_ticks = int(round((min(o,c) - l) / tick))
+
+        # choose the *smallest* N that passed (more strict)
+        n_used = min(ok_lb)
+        recs.append({
+            "symbol": symbol,
+            "time_utc": to_utc(kl[idx][0]),
+            "close": c,
+            "body": round(body, 2),
+            "n_used": n_used,
+            "hi": h,
+            "lo": l,
+            "bottom_wick_ticks": bottom_wick_ticks,
+            "tick": tick,
+            "candles_ago": candles_ago,
+        })
+    return recs
+
+# ---------- main ----------
+def main():
+    syms = get_universe()
     print("symbol,time_utc,close,body,n_used,hi,lo,bottom_wick_ticks,tick,candles_ago")
-    scanned=hits=0
-    with cf.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-        for lines in ex.map(lambda rec: scan_symbol(sess, args.api, rec, args.interval, args.window, lookbacks, args.min_body, args.untouched, args.max_candles_ago, args.target_pct), syms, chunksize=20):
+    hits = 0
+    scanned = 0
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(breakout_records, s): s for s in syms}
+        for fut in as_completed(futs):
             scanned += 1
-            if not lines: continue
-            hits += len(lines)
-            for ln in lines: print(ln)
-    sys.stderr.write(f"# scanned={scanned} hits={hits} window={args.window} max_candles_ago={args.max_candles_ago}\n")
+            try:
+                for r in fut.result():
+                    hits += 1
+                    print("{symbol},{time_utc},{close},{body:.2f},{n_used},{hi},{lo},{bottom_wick_ticks},{tick},{candles_ago}"
+                          .format(**r), flush=True)
+            except Exception as e:
+                # keep running on errors (e.g., persistent 429 on a symbol)
+                print(f"# warn symbol={futs[fut]} err={type(e).__name__} {e}", file=sys.stderr)
+
+    print(f"# scanned={scanned} hits={hits} window={args.window} max_candles_ago={args.max_candles_ago}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
