@@ -1,233 +1,203 @@
+#!/usr/bin/env python3
 # breakout_scanner.py
-# MEXC 4H breakout scanner — fresh signals, full-body green candle, untouched low rule
-# Ready to copy-paste into GitHub repo
-
-import argparse, concurrent.futures as cf, math, time, sys
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+import argparse, time, math, sys, csv, concurrent.futures as cf
+from typing import List, Dict, Any, Tuple, Optional
 import requests
 
-# ---------- CLI ----------
-p = argparse.ArgumentParser("MEXC 4H Breakout Scanner")
-p.add_argument("--api", default="https://api.mexc.com", help="MEXC REST base URL")
-p.add_argument("--interval", default="4h", help="Kline interval, default 4h")
-p.add_argument("--window", type=int, default=45, help="How many recent candles to scan backward")
-p.add_argument("--lookbacks", default="10,15", help="Breakout lookbacks, comma separated")
-p.add_argument("--min-body", type=float, default=0.70, help="Full-body threshold 0..1")
-p.add_argument("--untouched", choices=["none", "next", "all"], default="all",
-               help="Low of signal candle must not be touched by next or all subsequent candles")
-p.add_argument("--max-candles-ago", type=int, default=1,
-               help="Only accept signals that are <= this many candles old")
-p.add_argument("--target-pct", type=float, default=None,
-               help="If set e.g. 0.05 then discard signals that already hit +5% target after the signal")
-p.add_argument("--symbols-file", default=None, help="Optional file with symbols one per line")
-p.add_argument("--workers", type=int, default=8, help="Thread workers")
-p.add_argument("--sleep", type=float, default=0.25, help="Sleep seconds between API calls to avoid 429")
-p.add_argument("--quote", default="USDT", help="Quote asset filter for universe, default USDT")
-args = p.parse_args()
-
-LOOKBACKS = [int(x) for x in args.lookbacks.split(",") if x.strip()]
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/1.0"})
-DEFAULT_TICK = 1e-6
-
-# ---------- HTTP helpers ----------
-def http_get(url: str, params: Dict = None, max_retries: int = 6) -> requests.Response:
-    """GET with basic 429 backoff"""
-    params = params or {}
-    backoff = args.sleep
-    for i in range(max_retries):
-        r = SESSION.get(url, params=params, timeout=30)
+# -------- HTTP helpers with retry & backoff --------
+def http_get(session: requests.Session, url: str, **params):
+    backoff = 0.6
+    for i in range(6):
+        r = session.get(url, params=params, timeout=20)
         if r.status_code == 429:
             time.sleep(backoff)
-            backoff = min(backoff * 2, 5.0)
+            backoff *= 1.7
             continue
         r.raise_for_status()
         return r
     r.raise_for_status()
-    return r  # never reaches
+    return r
 
-# ---------- Universe & tick size ----------
-def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
-    """Return list of (symbol, tick_size) for spot pairs quoted in `quote`"""
-    out: List[Tuple[str, float]] = []
-    ticks: Dict[str, float] = {}
-
-    # 1) Try exchangeInfo
+# -------- Exchange metadata --------
+def get_exchange_info_symbols(session, api: str) -> Tuple[List[str], Dict[str, float]]:
+    syms, ticks = [], {}
     try:
-        ei = http_get(f"{api}/api/v3/exchangeInfo").json()
-        syms = ei.get("symbols", [])
-        for s in syms:
-            sym = s.get("symbol") or s.get("symbolName")
-            if not sym or not sym.endswith(quote):
+        data = http_get(session, f"{api}/api/v3/exchangeInfo").json()
+        for s in data.get("symbols", []):
+            if s.get("status") != "TRADING":
                 continue
-            status = s.get("status", "TRADING")
-            perms = set(s.get("permissions", []) or s.get("permissionList", []) or [])
-            spot_ok = ("SPOT" in perms) or True  # many MEXC payloads omit this
-            if status not in ("TRADING", "ENABLED"):
+            if not s.get("symbol", "").endswith("USDT"):
                 continue
-            if not spot_ok:
-                continue
-
-            tick = DEFAULT_TICK
+            syms.append(s["symbol"])
+            tick = 1e-6
             for f in s.get("filters", []):
-                if f.get("filterType") in ("PRICE_FILTER", "price_filter"):
-                    ts = f.get("tickSize") or f.get("tick_size")
-                    if ts:
-                        try:
-                            tick = float(ts)
-                        except:
-                            pass
-            ticks[sym] = tick
-        if ticks:
-            out = sorted([(k, ticks[k]) for k in ticks])
-        # If we found nothing, fall back
+                if f.get("filterType") == "PRICE_FILTER":
+                    tick = float(f.get("tickSize", tick))
+            ticks[s["symbol"]] = tick
     except Exception:
         pass
+    return syms, ticks
 
-    # 2) Fallback to ticker/price when exchangeInfo is empty or filtered out
-    if not out:
-        print("# exchangeInfo returned zero symbols for USDT, falling back", file=sys.stdout)
-        try:
-            tp = http_get(f"{api}/api/v3/ticker/price").json()
-            symbols = sorted({row["symbol"] for row in tp if row.get("symbol", "").endswith(quote)})
-            out = [(s, DEFAULT_TICK) for s in symbols]
-        except Exception:
-            out = []
+def get_symbols_from_ticker(session, api: str) -> List[str]:
+    data = http_get(session, f"{api}/api/v3/ticker/price").json()
+    return [d["symbol"] for d in data if d["symbol"].endswith("USDT")]
 
-    return out
+def build_universe(session, api: str, symbols_file: Optional[str]) -> Tuple[List[str], Dict[str, float]]:
+    ticks: Dict[str, float] = {}
+    if symbols_file:
+        with open(symbols_file, "r", encoding="utf-8") as f:
+            syms = [ln.strip().upper() for ln in f if ln.strip()]
+    else:
+        syms, ticks = get_exchange_info_symbols(session, api)
+        if not syms:
+            syms = get_symbols_from_ticker(session, api)
+    # تضمین عدم حذف اختیاری
+    for must in ["HIPPOPUSDT", "AIAUSDT"]:
+        if must not in syms:
+            syms.append(must)
+    return sorted(set(syms)), ticks
 
-def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip().upper()
-            if s:
-                out.append((s, DEFAULT_TICK))
-    return out
+# -------- Market data --------
+def get_klines(session, api: str, symbol: str, interval: str, limit: int) -> List[List[Any]]:
+    return http_get(session, f"{api}/api/v3/klines", symbol=symbol, interval=interval, limit=limit).json()
 
-# ---------- Data ----------
-def get_klines(symbol: str, interval: str, limit: int):
-    time.sleep(args.sleep)  # friendly throttle
-    data = http_get(f"{args.api}/api/v3/klines", {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }).json()
-    # each item: [openTime, open, high, low, close, volume, closeTime, ...]
-    kl = []
-    for r in data:
-        ts = int(r[0])
-        o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4])
-        ct = int(r[6])
-        kl.append((ts, o, h, l, c, ct))
-    return kl
+# -------- Math --------
+def body_ratio(o: float, h: float, l: float, c: float) -> float:
+    rng = max(h - l, 0.0)
+    if rng <= 0:
+        return 0.0
+    return abs(c - o) / rng
 
-def to_utc(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def is_green(o: float, c: float) -> bool:
+    return c > o
 
-# ---------- Logic ----------
-def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
-    symbol, tick = rec
-    # limit big enough for window + largest lookback + room for post-signal checks
-    limit = max(args.window + max(LOOKBACKS) + 5, args.max_candles_ago + max(LOOKBACKS) + 5)
+# strict breakout above BOTH 10 and 15 highs
+def strict_breakout_above(highs: List[float], idx: int, lookbacks: List[int], close_: float, tick: float) -> Tuple[bool, int, float]:
+    # idx = index of signal candle
+    maxes = []
+    for n in lookbacks:
+        if idx - n < 0:
+            return False, 0, 0.0
+        prev_max = max(highs[idx - n: idx])  # exclude current candle
+        maxes.append(prev_max)
+    bench = max(maxes)  # must clear the bigger of 10 or 15
+    return close_ >= bench + tick, max(lookbacks), bench
+
+# next candle must not touch signal low
+def untouched_next_low(lows: List[float], idx: int, tick: float) -> bool:
+    if idx + 1 >= len(lows):
+        return False  # برای قانون next باید کندل بعدی موجود باشد
+    return lows[idx + 1] > lows[idx] + tick
+
+# did target get hit after signal
+def target_hit_after(close_series: List[float], highs: List[float], idx: int, target_pct: float) -> bool:
+    need = close_series[idx] * (1.0 + target_pct)
+    for j in range(idx + 1, len(highs)):
+        if highs[j] >= need:
+            return True
+    return False
+
+# -------- Scanner per symbol --------
+def scan_symbol(session, api: str, symbol: str, interval: str, window: int, lookbacks: List[int],
+                min_body: float, max_candles_ago: int, target_pct: Optional[float],
+                untouched_rule: str, tick_map: Dict[str, float]) -> Optional[Tuple]:
+    limit = window + max(lookbacks) + 5
     try:
-        kl = get_klines(symbol, args.interval, limit)
+        raw = get_klines(session, api, symbol, interval, limit)
     except Exception:
         return None
-    if len(kl) < max(LOOKBACKS) + 2:
+
+    if len(raw) < max(lookbacks) + 2:
         return None
 
-    last = len(kl) - 1
-    start = max(last - args.window, max(LOOKBACKS))
+    O, H, L, C, T = [], [], [], [], []
+    for r in raw:
+        o, h, l, c = map(float, r[:4])
+        O.append(o); H.append(h); L.append(l); C.append(c); T.append(int(r[0]))
 
-    # iterate from newest to older — first valid becomes THE signal for this symbol
-    for idx in range(last, start - 1, -1):
-        ts, o, h, l, c, cts = kl[idx]
-        rng = h - l
-        if rng <= 0:
+    tick = tick_map.get(symbol, 1e-6)
+
+    # در این نسخه فقط تازه ترین سیگنال معتبر هر نماد را میگیریم
+    best = None
+    # فقط در بازه آخر window کندل را ارزیابی کن
+    start = max(len(C) - window, max(lookbacks))
+    end = len(C) - 2  # حداقل یک کندل بعدی برای قانون next_low
+    for i in range(end, start - 1, -1):  # از آخر به اول برای تازه تر
+        candles_ago = len(C) - 1 - i
+        if candles_ago > max_candles_ago:
             continue
-        if c <= o:
-            continue  # must be green body
-        body = (c - o) / rng
-        if body < args.min_body:
+        if not is_green(O[i], C[i]):
+            continue
+        br = body_ratio(O[i], H[i], L[i], C[i])
+        if br < min_body:
             continue
 
-        # breakout over highs of last N
-        passed_N = []
-        for N in LOOKBACKS:
-            if idx - N < 0:
-                continue
-            prev_high = max(kl[idx - N: idx], key=lambda x: x[2])[2]
-            if c > prev_high:
-                passed_N.append(N)
-        if not passed_N:
+        ok, n_used, bench = strict_breakout_above(H, i, lookbacks, C[i], tick)
+        if not ok:
             continue
-        n_used = min(passed_N)
 
-        # candles_ago constraint — freshness
-        candles_ago = last - idx
-        if candles_ago > args.max_candles_ago:
-            # since we walk from fresh to old, anything older no longer matters
-            break
+        if untouched_rule == "next_low" and not untouched_next_low(L, i, tick):
+            continue
 
-        # untouched rule for the signal candle low
-        if args.untouched == "next":
-            if idx + 1 <= last and kl[idx + 1][3] <= l:
-                continue
-        elif args.untouched == "all":
-            touched = any(kl[j][3] <= l for j in range(idx + 1, last + 1))
-            if touched:
-                continue
+        if target_pct is not None and target_hit_after(C, H, i, target_pct):
+            continue
 
-        # optional target not yet hit
-        if args.target_pct is not None:
-            target = c * (1.0 + args.target_pct)
-            hit = any(kl[j][2] >= target for j in range(idx + 1, last + 1))
-            if hit:
-                continue
+        best = (symbol, i, candles_ago, C[i], br, n_used, H[i], L[i], tick)
+        break
 
-        # metrics for report
-        bottom_wick = max(0.0, min(o, c) - l)
-        tick_size = tick if tick and tick > 0 else DEFAULT_TICK
-        bottom_wick_ticks = int(round(bottom_wick / tick_size))
+    if not best:
+        return None
+    sym, i, candles_ago, close_, br, n_used, hi, lo, tick = best
+    ts = time.gmtime(T[i] // 1000)
+    tstr = time.strftime("%Y-%m-%d %H:%M UTC", ts)
+    bottom_wick_ticks = max(int(round((min(O[i], C[i]) - lo) / tick)), 0)
+    return (sym, tstr, close_, round(br, 2), n_used, hi, lo, bottom_wick_ticks, tick, candles_ago)
 
-        row = [
-            symbol,
-            to_utc(ts),
-            f"{c:g}",
-            f"{body:.2f}",
-            f"{n_used}",
-            f"{h:g}",
-            f"{l:g}",
-            f"{bottom_wick_ticks}",
-            f"{tick_size:g}",
-            f"{candles_ago}",
-        ]
-        return ",".join(row)
-
-    return None
-
-# ---------- Main ----------
+# -------- Main --------
 def main():
-    # build universe
-    if args.symbols_file:
-        universe = load_universe_from_file(args.symbols_file)
-        source_note = "symbols_file"
-    else:
-        universe = load_universe(args.api, args.quote)
-        source_note = "exchangeInfo" if universe else "ticker/price"
+    p = argparse.ArgumentParser()
+    p.add_argument("--api", default="https://api.mexc.com")
+    p.add_argument("--interval", default="4h")
+    p.add_argument("--window", type=int, default=45)
+    p.add_argument("--lookbacks", default="10,15")
+    p.add_argument("--min-body", type=float, default=0.70)
+    p.add_argument("--untouched", choices=["none", "next_low"], default="next_low")
+    p.add_argument("--max-candles-ago", type=int, default=1)
+    p.add_argument("--target-pct", type=float, default=None)
+    p.add_argument("--symbols-file", default=None)
+    p.add_argument("--concurrency", type=int, default=8)
+    args = p.parse_args()
 
-    print(f"# universe source={source_note} symbols={len(universe)}")
-    print("symbol,time_utc,close,body,n_used,hi,lo,bottom_wick_ticks,tick,candles_ago")
+    lookbacks = sorted({int(x) for x in args.lookbacks.split(",") if x.strip()})
+    sess = requests.Session()
 
-    if not universe:
+    syms, ticks = build_universe(sess, args.api, args.symbols_file)
+    if not syms:
+        print("# universe symbols=0")
         return
 
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for res in ex.map(scan_symbol, universe, chunksize=20):
-            if res:
-                print(res, flush=True)
+    print("# universe symbols=%d" % len(syms))
+    print("symbol,time_utc,close,body,n_used,hi,lo,bottom_wick_ticks,tick,candles_ago")
+
+    out: List[Tuple] = []
+    with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futures = [ex.submit(scan_symbol, sess, args.api, s, args.interval, args.window,
+                             lookbacks, args.min_body, args.max_candles_ago,
+                             args.target_pct, args.untouched, ticks) for s in syms]
+        for fut in cf.as_completed(futures):
+            row = fut.result()
+            if row:
+                out.append(row)
+
+    # یکتا و فقط تازه ترین
+    latest: Dict[str, Tuple] = {}
+    for r in out:
+        sym = r[0]
+        if sym not in latest or r[-1] < latest[sym][-1]:
+            latest[sym] = r
+
+    for r in sorted(latest.values(), key=lambda x: (x[-1], x[0])):
+        print(f"{r[0]},{r[1]},{r[2]},{r[3]:.2f},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}")
 
 if __name__ == "__main__":
     main()
