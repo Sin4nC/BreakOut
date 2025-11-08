@@ -1,13 +1,16 @@
 # breakout_scanner.py
-# MEXC 4H breakout scanner — strict rules, NO freshness filter
-# Core rules:
-#   • Bullish only: close > open
-#   • Full-body: (close - open) / (high - low) >= 0.70
-#   • Breakout: close > tick_floor(max(high of previous N CLOSED candles)) for N in {15,20}
-#   • Bottom wick <= 1 tick
-#   • Untouched low: by default NO subsequent candle may touch the signal low ("all")
+# MEXC 4H breakout scanner — defaults tuned for Forz4crypto
+# Rules:
+#   • timeframe: 4h
+#   • universe: MEXC spot USDT pairs via exchangeInfo (no hard excludes)
+#   • bullish only: close > open
+#   • full-body: (close - open) / (high - low) >= 0.70
+#   • breakout: close > floor_to_tick(max(high of previous N CLOSED candles)) for N in {15,20}
+#   • bottom wick <= 1 tick
+#   • untouched (default next): the NEXT candle's low must be strictly > signal low
+#   • freshness: accept signals where candles_ago <= 1 (computed vs last CLOSED candle)
 #
-# Output columns:
+# Output CSV:
 #   symbol,time_utc,close,body_ratio,n_used,high,low,bottom_wick_ticks,tick_size,candles_ago
 
 import argparse, concurrent.futures as cf, math, sys, time
@@ -22,10 +25,12 @@ p.add_argument("--interval", default="4h", help="Kline interval")
 p.add_argument("--window", type=int, default=180, help="how many recent candles to search back")
 p.add_argument("--lookbacks", default="15,20", help="breakout lookbacks, comma separated")
 p.add_argument("--min-body", type=float, default=0.70, help="full-body threshold 0..1")
-p.add_argument("--untouched", choices=["none", "next", "all"], default="all",
+p.add_argument("--untouched", choices=["none", "next", "all"], default="next",
                help="low of signal candle must not be touched by next or all subsequent candles")
 p.add_argument("--max-bottom-wick-ticks", type=int, default=1,
                help="require signal bottom wick in ticks <= this value")
+p.add_argument("--max-candles-ago", type=int, default=1,
+               help="accept signals with candles_ago <= this (vs last CLOSED candle)")
 p.add_argument("--symbols-file", default=None, help="optional file with symbols, one per line")
 p.add_argument("--workers", type=int, default=8, help="thread workers")
 p.add_argument("--sleep", type=float, default=0.20, help="sleep seconds between API calls to avoid 429")
@@ -34,10 +39,10 @@ args = p.parse_args()
 
 LOOKBACKS = [int(x) for x in args.lookbacks.split(",") if x.strip()]
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/1.2"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/1.3"})
 DEFAULT_TICK = 1e-6
 
-# ---------- helpers ----------
+# ---------- HTTP ----------
 def http_get(url: str, params: Dict = None, max_retries: int = 6) -> requests.Response:
     params = params or {}
     backoff = max(args.sleep, 0.05)
@@ -52,8 +57,8 @@ def http_get(url: str, params: Dict = None, max_retries: int = 6) -> requests.Re
     r.raise_for_status()
     return r
 
+# ---------- Quant ----------
 def q_floor(x: float, tick: float) -> float:
-    """Quantize down to tick grid to avoid float hairlines."""
     if tick <= 0:
         tick = DEFAULT_TICK
     return math.floor(x / tick) * tick
@@ -61,7 +66,7 @@ def q_floor(x: float, tick: float) -> float:
 def to_utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-# ---------- universe & tick ----------
+# ---------- Universe ----------
 def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
     out: List[Tuple[str, float]] = []
     ticks: Dict[str, float] = {}
@@ -103,7 +108,7 @@ def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
                 out.append((s, DEFAULT_TICK))
     return out
 
-# ---------- market data ----------
+# ---------- Data ----------
 def get_klines(symbol: str, interval: str, limit: int):
     time.sleep(max(args.sleep, 0.0))
     data = http_get(f"{args.api}/api/v3/klines", {
@@ -118,11 +123,19 @@ def get_klines(symbol: str, interval: str, limit: int):
         kl.append((ts, o, h, l, c, ct))
     return kl
 
-# ---------- core logic ----------
+def last_closed_index(kl: List[Tuple[int,float,float,float,float,int]]) -> int:
+    """Return index of the last CLOSED candle; excludes the still-open bar if present."""
+    if not kl:
+        return -1
+    now_ms = int(time.time() * 1000)
+    last = len(kl) - 1
+    # if closeTime of last bar is in the future, that bar is still open
+    return last if kl[last][5] <= now_ms else last - 1
+
+# ---------- Scan ----------
 def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     symbol, tick = rec
-    # enough candles for window + biggest lookback + a few bars after for untouched test
-    limit = max(args.window + max(LOOKBACKS) + 5, max(LOOKBACKS) + 10)
+    limit = max(args.window + max(LOOKBACKS) + 8, max(LOOKBACKS) + 12)
     try:
         kl = get_klines(symbol, args.interval, limit)
     except Exception:
@@ -130,12 +143,14 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     if len(kl) < max(LOOKBACKS) + 2:
         return None
 
-    last_closed = len(kl) - 1
-    start = max(last_closed - args.window, max(LOOKBACKS))
+    lc = last_closed_index(kl)
+    if lc < max(LOOKBACKS):
+        return None
 
-    for idx in range(last_closed, start - 1, -1):
+    start = max(lc - args.window, max(LOOKBACKS))
+
+    for idx in range(lc, start - 1, -1):
         ts, o, h, l, c, _ = kl[idx]
-
         rng = h - l
         if rng <= 0:
             continue
@@ -156,7 +171,7 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
         if bottom_wick_ticks > args.max_bottom_wick_ticks:
             continue
 
-        # breakout for any N in LOOKBACKS using previous N CLOSED candles only
+        # breakout over previous N CLOSED candles (exclude current idx)
         passed_any = []
         for N in LOOKBACKS:
             left = idx - N
@@ -168,16 +183,22 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
         if not passed_any:
             continue
 
+        # freshness vs LAST CLOSED candle
+        candles_ago = lc - idx
+        if candles_ago > args.max_candles_ago:
+            # چون از جدید به قدیم می‌رویم، قدیمی‌ترها را نادیده بگیر
+            break
+
         # untouched low rule
         if args.untouched == "next":
-            if idx + 1 <= last_closed and kl[idx + 1][3] <= l:
+            if idx + 1 <= lc and kl[idx + 1][3] <= l:
                 continue
         elif args.untouched == "all":
-            if any(kl[j][3] <= l for j in range(idx + 1, last_closed + 1)):
+            if any(kl[j][3] <= l for j in range(idx + 1, lc + 1)):
                 continue
+        # 'none' یعنی بدون بررسی
 
         n_used = min(passed_any)
-        candles_ago = last_closed - idx  # reported only (no filtering)
 
         row = [
             symbol,
@@ -195,7 +216,7 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
 
     return None
 
-# ---------- main ----------
+# ---------- Main ----------
 def main():
     if args.symbols_file:
         universe = load_universe_from_file(args.symbols_file)
