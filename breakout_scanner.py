@@ -1,298 +1,227 @@
-# breakout_scanner.py
-# Full replacement file — copy paste over your repo
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
 import sys
-import time
 import math
 import json
-import argparse
-from typing import Dict, List, Tuple, Optional
-
+import time
+from typing import List, Tuple, Dict
 import requests
 from datetime import datetime, timezone
 
+# =========================
+# Config via ENV (defaults)
+# =========================
+TIMEFRAME          = os.environ.get("TIMEFRAME", "4h").lower()
+CANDLE_WINDOW      = int(os.environ.get("CANDLE_WINDOW", "180"))
+MAX_CANDLES_AGO    = int(os.environ.get("MAX_CANDLES_AGO", "1"))   # fresh by default
+MIN_BODY           = float(os.environ.get("MIN_BODY", "0.70"))
+LOOKBACKS          = [int(x.strip()) for x in os.environ.get("LOOKBACKS", "15,20").split(",") if x.strip()]
+BOTTOM_WICK_TICKS  = int(os.environ.get("BOTTOM_WICK_TICKS", "1"))
+UNTOUCHED          = os.environ.get("UNTOUCHED", "next_low").lower()  # none | next_low | next_highlow | all
+WATCH              = [x.strip().upper() for x in os.environ.get("WATCH", "").split(",") if x.strip()]
+DEBUG              = int(os.environ.get("DEBUG", "0"))
+
+# Constants
 MEXC_BASE = "https://api.mexc.com"
+INTERVAL  = "4h"  # scanner default per user
+if TIMEFRAME != "4h":
+    print(f"# WARNING: Only 4h is supported now, forcing 4h", file=sys.stderr)
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
-def env_default(key: str, fallback: Optional[str] = None):
-    v = os.environ.get(key)
-    return v if v is not None else fallback
+# =========================
+def debug(msg: str):
+    if DEBUG:
+        print(msg, file=sys.stderr)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="MEXC USDT Breakout Scanner")
+def iso_utc(ms: int) -> str:
+    return datetime.utcfromtimestamp(ms/1000).replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
-    # core
-    p.add_argument("--timeframe", default=env_default("TIMEFRAME", "4h"))
-    p.add_argument("--candle_window", type=int, default=int(env_default("CANDLE_WINDOW", "180")))
-    p.add_argument("--max_candles_ago", type=int, default=int(env_default("MAX_CANDLES_AGO", "1")))
-    p.add_argument("--min_body", type=float, default=float(env_default("MIN_BODY", "0.70")))
-    p.add_argument("--lookbacks", default=env_default("LOOKBACKS", "15,20"))
-    p.add_argument("--untouched", choices=["next_low", "next_highlow", "all", "none"],
-                   default=env_default("UNTOUCHED", "next_low"))
+def floor_to_tick(x: float, tick: float) -> float:
+    if tick <= 0:
+        return x
+    return math.floor(x / tick) * tick
 
-    # universe control
-    p.add_argument("--watch", default=env_default("WATCH", "").strip())
-    p.add_argument("--universe", default=env_default("UNIVERSE", "mexc_usdt_spot"))
+def get_exchange_info() -> Dict:
+    url = f"{MEXC_BASE}/api/v3/exchangeInfo"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-    # misc
-    p.add_argument("--timeout", type=int, default=int(env_default("HTTP_TIMEOUT", "15")))
-    p.add_argument("--retries", type=int, default=int(env_default("HTTP_RETRIES", "3")))
-    p.add_argument("--debug", action="store_true" if env_default("DEBUG", "0") == "1" else "store_false")
-
-    return p.parse_args()
-
-def http_get(url: str, params=None, timeout=15, retries=3):
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            # small backoff on non-200 as well
-        except Exception:
-            pass
-        time.sleep(0.5 * (i + 1))
-    raise RuntimeError(f"HTTP GET failed for {url} params={params}")
-
-def load_exchange_info(timeout=15, retries=3):
-    data = http_get(f"{MEXC_BASE}/api/v3/exchangeInfo", timeout=timeout, retries=retries)
-    symbols = data.get("symbols", [])
-    result = {}
-    for s in symbols:
-        try:
-            if s.get("status") != "TRADING":
-                continue
-            if s.get("quoteAsset") != "USDT":
-                continue
-            # spot only if permissions present
-            perms = s.get("permissions") or s.get("permissionsList") or []
-            if perms and "SPOT" not in perms:
-                continue
-
-            symbol = s["symbol"]
-
-            tick_size = None
-            step_size = None
-            for f in s.get("filters", []):
-                n = f.get("filterType") or f.get("filter_type") or ""
-                if n == "PRICE_FILTER":
-                    tick_size = float(f.get("tickSize") or f.get("tick_size") or "0.0001")
-                if n == "LOT_SIZE":
-                    step_size = float(f.get("stepSize") or f.get("step_size") or "1")
-
-            if tick_size is None:
-                # safe fallback
-                tick_size = 0.0001
-            if step_size is None:
-                step_size = 1.0
-
-            result[symbol] = {
-                "base": s.get("baseAsset"),
-                "quote": s.get("quoteAsset"),
-                "tick_size": tick_size,
-                "step_size": step_size,
-            }
-        except Exception:
-            # ignore malformed entries
+def list_mexc_spot_usdt_symbols() -> Dict[str, Dict]:
+    """Return {symbol: {'tickSize': ..., 'status': ...}} filtered to USDT quote, spot, trading"""
+    info = get_exchange_info()
+    out = {}
+    for s in info.get("symbols", []):
+        if s.get("quoteAsset") != "USDT":
             continue
-    return result
-
-def klines(symbol: str, interval: str, limit: int, timeout=15, retries=3):
-    # MEXC Klines format like Binance
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = http_get(f"{MEXC_BASE}/api/v3/klines", params=params, timeout=timeout, retries=retries)
-    out = []
-    for row in data:
-        # [ openTime, open, high, low, close, volume, closeTime, ... ]
-        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-        ot = int(row[0]); ct = int(row[6])
-        out.append({
-            "open": o, "high": h, "low": l, "close": c,
-            "open_time": ot, "close_time": ct
-        })
+        if s.get("status") != "TRADING":
+            continue
+        # Find tickSize from filters
+        tick_size = None
+        for f in s.get("filters", []):
+            if f.get("filterType") == "PRICE_FILTER":
+                tick_size = float(f.get("tickSize", "0.00000001"))
+                break
+        if not tick_size:
+            tick_size = 0.00000001
+        out[s["symbol"]] = {"tickSize": tick_size}
     return out
 
-def tick_floor(x: float, tick: float) -> int:
-    # stable floor to integer ticks
-    return math.floor((x + 1e-12) / tick)
+def fetch_klines(symbol: str, limit: int) -> List[List]:
+    url = f"{MEXC_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def utc_from_ms(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+def body_ratio(open_, high, low, close) -> float:
+    rng = max(high - low, 1e-12)
+    body = abs(close - open_)
+    return body / rng
 
-# -----------------------------
-# Signal logic
-# -----------------------------
-def body_ratio(c):
-    rng = c["high"] - c["low"]
-    if rng <= 0:
-        return 0.0
-    return (c["close"] - c["open"]) / rng
-
-def bottom_wick_ticks(c, tick):
-    bw = min(c["open"], c["close"]) - c["low"]
-    if bw < 0:
+def bottom_wick_ticks(open_, low, close, tick_size) -> int:
+    lower_body = min(open_, close)
+    bw = max(lower_body - low, 0.0)
+    if tick_size <= 0:
         return 0
-    return tick_floor(bw, tick)
+    return int(round(bw / tick_size))
 
-def close_above_prev_highs(candles: List[dict], i: int, tick: float, lookbacks: List[int]) -> Tuple[bool, Optional[int]]:
-    c = candles[i]
-    c_tick = tick_floor(c["close"], tick)
-    for n in lookbacks:
-        if i - n < 0:
+def passes_breakout(close, highs_window, tick_size) -> Tuple[bool, int]:
+    """
+    Returns (ok, lookbackN) where ok is True if close > max(highs of any lookback in LOOKBACKS) after tick-floor.
+    """
+    for N in LOOKBACKS:
+        if len(highs_window) < N:
             continue
-        prev_high = max(candles[i - n:i], key=lambda x: x["high"])["high"]
-        prev_tick = tick_floor(prev_high, tick)
-        if c_tick > prev_tick:
-            return True, n
-    return False, None
+        ref = max(highs_window[-N:])
+        ref_q = floor_to_tick(ref, tick_size)
+        if close > ref_q:
+            return True, N
+    return False, 0
 
-def has_untouched(candles: List[dict], i: int, tick: float, mode: str) -> bool:
-    if mode == "none":
+def check_untouched(rule: str, signal_idx: int, candles: List[List]) -> bool:
+    """
+    rule:
+      - none: skip check
+      - next_low: next candle's low must be > signal low
+      - next_highlow: next candle's low > signal low AND next candle's high < signal high
+      - all: for all subsequent candles up to last closed, lows > signal low AND highs < signal high
+    """
+    if rule == "none":
         return True
+    if signal_idx >= len(candles) - 1:
+        return True  # no next candle yet
 
-    # need at least 1 subsequent candle
-    if i >= len(candles) - 1:
-        return False
+    sig = candles[signal_idx]
+    sig_high = float(sig[2])
+    sig_low  = float(sig[3])
 
-    sig = candles[i]
-    nextc = candles[i + 1]
+    nxt = candles[signal_idx + 1]
+    next_low = float(nxt[3])
+    next_high = float(nxt[2])
 
-    sig_low_tick = tick_floor(sig["low"], tick)
-    sig_high_tick = tick_floor(sig["high"], tick)
-
-    if mode == "next_low":
-        return tick_floor(nextc["low"], tick) > sig_low_tick
-
-    if mode == "next_highlow":
-        return (tick_floor(nextc["low"], tick) > sig_low_tick) and (tick_floor(nextc["high"], tick) < sig_high_tick)
-
-    if mode == "all":
-        for k in range(i + 1, len(candles)):
-            if tick_floor(candles[k]["low"], tick) <= sig_low_tick:
-                return False
-            if tick_floor(candles[k]["high"], tick) >= sig_high_tick:
+    if rule == "next_low":
+        return next_low > sig_low
+    if rule == "next_highlow":
+        return (next_low > sig_low) and (next_high < sig_high)
+    if rule == "all":
+        for i in range(signal_idx + 1, len(candles)):
+            c = candles[i]
+            h = float(c[2]); l = float(c[3])
+            if (l <= sig_low) or (h >= sig_high):
                 return False
         return True
-
     return True
 
-def find_signals_for_symbol(sym: str,
-                            info: Dict,
-                            tf: str,
-                            candle_window: int,
-                            max_candles_ago: int,
-                            min_body: float,
-                            lookbacks: List[int],
-                            untouched: str,
-                            timeout: int,
-                            retries: int,
-                            debug: bool = False) -> List[Dict]:
-    out = []
-    data = klines(sym, tf, limit=candle_window + 30, timeout=timeout, retries=retries)
-    if len(data) < max(lookbacks) + 2:
-        return out
-
-    tick = info["tick_size"]
-
-    # iterate over recent candles as candidates
-    for ago in range(0, max_candles_ago):
-        i = len(data) - 1 - ago  # candidate index
-        if i <= 0 or i >= len(data):
-            continue
-
-        c = data[i]
-        if c["close"] <= c["open"]:
-            if debug:
-                print(f"[{sym}] skip idx {i} not green")
-            continue
-
-        br = body_ratio(c)
-        if br < min_body:
-            if debug:
-                print(f"[{sym}] skip idx {i} body_ratio={br:.3f} < {min_body}")
-            continue
-
-        bwt = bottom_wick_ticks(c, tick)
-        if bwt > 1:
-            if debug:
-                print(f"[{sym}] skip idx {i} bottom_wick_ticks={bwt} > 1")
-            continue
-
-        ok, used_lb = close_above_prev_highs(data, i, tick, lookbacks)
-        if not ok:
-            if debug:
-                print(f"[{sym}] skip idx {i} close not above prev highs {lookbacks}")
-            continue
-
-        if not has_untouched(data, i, tick, untouched):
-            if debug:
-                print(f"[{sym}] skip idx {i} untouched rule failed mode={untouched}")
-            continue
-
-        out.append({
-            "symbol": sym,
-            "signal_utc": utc_from_ms(c["close_time"]),
-            "close": c["close"],
-            "body_ratio": br,
-            "lookbackN": used_lb,
-            "high": c["high"],
-            "low": c["low"],
-            "bottom_wick_ticks": bwt,
-            "tick_size": tick,
-            "candles_ago": ago
-        })
-
-    return out
-
-# -----------------------------
+# =========================
 # Main
-# -----------------------------
+# =========================
 def main():
-    args = parse_args()
-
-    # lookbacks parse and ensure ascending unique ints
-    lbs = sorted({int(x) for x in args.lookbacks.split(",") if x.strip()})
-
-    ex = load_exchange_info(timeout=args.timeout, retries=args.retries)
-
-    # universe
-    if args.universe != "mexc_usdt_spot":
-        print(f"# Unknown universe {args.universe}, defaulting to mexc_usdt_spot", file=sys.stderr)
-
-    symbols = sorted(ex.keys())
-
-    # optional watch filter
-    if args.watch:
-        watch = {s.strip().upper() for s in args.watch.split(",") if s.strip()}
-        symbols = [s for s in symbols if s in watch]
-
-    # HIPPOPUSDT and AIAUSDT must never be hard-excluded — no-op here
-
-    # header
+    # CSV header
     print("symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago")
 
+    universe = list_mexc_spot_usdt_symbols()
+    symbols = sorted(universe.keys())
+
+    if WATCH:
+        watch_set = set([s.upper() for s in WATCH])
+        symbols = [s for s in symbols if s.upper() in watch_set]
+        if DEBUG:
+            debug(f"# WATCH mode active for {len(symbols)} symbols: {symbols}")
+
+    # how many klines to request
+    need = max(CANDLE_WINDOW, max(LOOKBACKS) + 5)
+    limit = min(max(need, 50), 1000)
+
     for sym in symbols:
+        tick = universe[sym]["tickSize"]
         try:
-            sigs = find_signals_for_symbol(
-                sym=sym,
-                info=ex[sym],
-                tf=args.timeframe,
-                candle_window=args.candle_window,
-                max_candles_ago=args.max_candles_ago,
-                min_body=args.min_body,
-                lookbacks=lbs,
-                untouched=args.untouched,
-                timeout=args.timeout,
-                retries=args.retries,
-                debug=args.debug and (not args.watch or sym in {s.strip().upper() for s in args.watch.split(",")})
-            )
-            for s in sigs:
-                print("{symbol},{signal_utc},{close:.8f},{body_ratio:.3f},{lookbackN},{high:.8f},{low:.8f},{bottom_wick_ticks},{tick_size:.8f},{candles_ago}".format(**s))
+            kl = fetch_klines(sym, limit=limit)
         except Exception as e:
-            # keep the run alive even if one symbol fails
-            print(f"# error {sym} {e}", file=sys.stderr)
+            debug(f"[{sym}] fetch_klines error: {e}")
+            continue
+
+        if len(kl) < 25:
+            debug(f"[{sym}] not enough candles")
+            continue
+
+        # kline fields: [openTime, open, high, low, close, volume, closeTime, ...]
+        # We only use closed candles (MEXC returns only closed for past intervals)
+        # Choose candidate indices within last MAX_CANDLES_AGO candles (1 = only last closed candle)
+        max_back = min(MAX_CANDLES_AGO, len(kl) - 1)
+        # indices of candidate candles (from the end)
+        cand_indices = list(range(len(kl) - max_back - 1, len(kl) - 1)) if MAX_CANDLES_AGO > 1 else [len(kl) - 2]
+
+        # If MAX_CANDLES_AGO == 1 → just last closed candle index = -2 (because -1 is partially next?)
+        # MEXC returns fully closed candles; still we keep -2 to be safe
+
+        found_any = False
+
+        for idx in reversed(cand_indices):
+            c = kl[idx]
+            ts = int(c[0])
+            o = float(c[1]); h = float(c[2]); l = float(c[3]); cl = float(c[4])
+
+            if cl <= o:
+                debug(f"[{sym}] {iso_utc(ts)} fail: not green")
+                continue
+
+            br = body_ratio(o, h, l, cl)
+            if br < MIN_BODY:
+                debug(f"[{sym}] {iso_utc(ts)} fail: body_ratio {br:.3f} < {MIN_BODY}")
+                continue
+
+            bwt = bottom_wick_ticks(o, l, cl, tick)
+            if bwt > BOTTOM_WICK_TICKS:
+                debug(f"[{sym}] {iso_utc(ts)} fail: bottom_wick_ticks {bwt} > {BOTTOM_WICK_TICKS}")
+                continue
+
+            # highs window before the signal candle
+            highs_before = [float(x[2]) for x in kl[:idx]]
+            ok, usedN = passes_breakout(cl, highs_before, tick)
+            if not ok:
+                debug(f"[{sym}] {iso_utc(ts)} fail: close not > max high of lookbacks {LOOKBACKS}")
+                continue
+
+            if not check_untouched(UNTOUCHED, idx, kl):
+                debug(f"[{sym}] {iso_utc(ts)} fail: untouched rule '{UNTOUCHED}' violated")
+                continue
+
+            # how many candles ago from the last closed
+            candles_ago = (len(kl) - 1) - idx
+            print(f"{sym},{iso_utc(ts)},{cl:.8f},{br:.3f},{usedN},{h:.8f},{l:.8f},{bwt},{tick:.8f},{candles_ago}")
+            found_any = True
+
+        if not found_any:
+            # keep silent to avoid huge logs unless DEBUG
+            if DEBUG:
+                debug(f"[{sym}] no signal in last {MAX_CANDLES_AGO} candles within window {CANDLE_WINDOW}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
