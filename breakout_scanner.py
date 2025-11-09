@@ -3,8 +3,8 @@
 # 1) green full-body candle with body_ratio >= 0.70
 # 2) close > max high of the previous 15 or 20 CLOSED candles
 # 3) untouched-low: subsequent CLOSED candles must not touch/break the signal low (default = all)
-# Report ONLY the latest valid signal per symbol within the scan window (default).
-# Freshness and wick filters are optional and OFF by default.
+# 4) suppression: drop any older signal if a later CLOSED candle sets a higher HIGH (default)
+# Report ONLY one signal per symbol (pick latest among remaining).
 
 import argparse, concurrent.futures as cf, time, sys
 from datetime import datetime, timezone
@@ -25,7 +25,9 @@ p.add_argument("--fresh-only", type=int, default=None,
 p.add_argument("--max-bottom-wick-ticks", type=int, default=None,
                help="Optional: require bottom wick <= this many ticks (default OFF)")
 p.add_argument("--pick", choices=["latest","earliest"], default="latest",
-               help="If multiple signals exist, report only the latest (default) or earliest")
+               help="If multiple signals exist after filtering, report latest (default) or earliest")
+p.add_argument("--suppress-by", choices=["none","higher_high","higher_close"], default="higher_high",
+               help="Drop a signal if any later CLOSED candle has a higher high/close (default higher_high)")
 p.add_argument("--symbols-file", default=None, help="Optional file with symbols one per line")
 p.add_argument("--workers", type=int, default=12, help="Thread workers")
 p.add_argument("--sleep", type=float, default=0.20, help="Sleep seconds between API calls")
@@ -34,7 +36,7 @@ args = p.parse_args()
 
 LOOKBACKS = [int(x) for x in args.lookbacks.split(",") if x.strip()]
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/1.3"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/1.4"})
 DEFAULT_TICK = 1e-6
 
 # ---------- HTTP ----------
@@ -45,10 +47,8 @@ def http_get(url: str, params: Dict = None, max_retries: int = 6) -> requests.Re
         r = SESSION.get(url, params=params, timeout=30)
         if r.status_code == 429:
             time.sleep(backoff); backoff = min(backoff * 2, 5.0); continue
-        r.raise_for_status()
-        return r
-    r.raise_for_status()
-    return r
+        r.raise_for_status(); return r
+    r.raise_for_status(); return r
 
 # ---------- Universe & tick ----------
 def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
@@ -126,18 +126,17 @@ def signals_for_symbol(rec: Tuple[str,float]) -> List[Tuple[int,str]]:
 
     found: List[Tuple[int,str]] = []
 
-    # scan newest -> older so اگر فقط اولی را بخواهیم همان آخرین خواهد بود
     for idx in range(last_idx, start-1, -1):
         ts,o,h,l,c,ct = kl[idx]
         rng = h - l
         if rng <= 0: continue
 
-        # 1) سبز و full-body
+        # 1) green & full-body
         if c <= o: continue
         body_ratio = (c - o) / rng
         if body_ratio < args.min_body: continue
 
-        # 2) کلوز > بیشترین high در N کندل بستهٔ قبلی
+        # 2) close > max high of previous N CLOSED candles
         passed = []
         for N in LOOKBACKS:
             if idx - N < 0: continue
@@ -150,17 +149,25 @@ def signals_for_symbol(rec: Tuple[str,float]) -> List[Tuple[int,str]]:
         if args.fresh_only is not None and candles_ago > args.fresh_only:
             continue
 
-        # 3) untouched-low روی کندل‌های بستهٔ بعد از سیگنال
+        # 3) untouched-low
         if args.untouched == "next":
             if idx+1 <= last_idx and kl[idx+1][3] <= l: continue
         elif args.untouched == "all":
             if any(kl[j][3] <= l for j in range(idx+1, last_idx+1)): continue
 
-        # 4) فیلتر اختیاری ویک پایینی
+        # 4) optional wick filter
         bottom_wick = max(0.0, min(o,c) - l)
         bottom_wick_ticks = int(round(bottom_wick / tick_size))
         if args.max_bottom_wick_ticks is not None and bottom_wick_ticks > args.max_bottom_wick_ticks:
             continue
+
+        # 5) suppression by later price action
+        if args.suppress_by == "higher_high":
+            if any(kl[j][2] > h for j in range(idx+1, last_idx+1)):  # later CLOSED candle with higher HIGH
+                continue
+        elif args.suppress_by == "higher_close":
+            if any(kl[j][4] > c for j in range(idx+1, last_idx+1)):  # later CLOSED candle with higher CLOSE
+                continue
 
         row = ",".join([
             symbol, to_utc(ts), f"{c:g}", f"{body_ratio:.2f}", f"{n_used}",
@@ -183,11 +190,7 @@ def main():
 
     def pick_one(res_list: List[Tuple[int,str]]) -> Optional[str]:
         if not res_list: return None
-        if args.pick == "latest":
-            # بیشترین اندیس = جدیدترین سیگنال
-            return max(res_list, key=lambda x: x[0])[1]
-        else:
-            return min(res_list, key=lambda x: x[0])[1]
+        return (max if args.pick=="latest" else min)(res_list, key=lambda x: x[0])[1]
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         for chosen in ex.map(lambda rec: pick_one(signals_for_symbol(rec)), universe, chunksize=32):
