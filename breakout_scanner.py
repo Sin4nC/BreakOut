@@ -1,200 +1,236 @@
 # breakout_scanner.py
-# MEXC 4H breakout scanner — rules:
-# 1) green full-body candle with body_ratio >= 0.70
-# 2) close > max high of the previous 15 or 20 CLOSED candles
-# 3) untouched-low: subsequent CLOSED candles must not touch/break the signal low (default = all)
-# 4) suppression: drop any older signal if a later CLOSED candle sets a higher HIGH (default)
-# Report ONLY one signal per symbol (pick latest among remaining).
+# MEXC 4H breakout scanner — USDT spot only, full-body green, strict breakout, untouched low, suppression rule
 
-import argparse, concurrent.futures as cf, time, sys
+import argparse, concurrent.futures as cf, math, time, sys
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 import requests
 
 # ---------- CLI ----------
 p = argparse.ArgumentParser("MEXC 4H Breakout Scanner")
-p.add_argument("--api", default="https://api.mexc.com", help="MEXC REST base URL")
-p.add_argument("--interval", default="4h", help="Kline interval")
-p.add_argument("--window", type=int, default=180, help="How many recent CLOSED candles to scan backward")
-p.add_argument("--lookbacks", default="15,20", help="Breakout lookbacks, comma separated")
-p.add_argument("--min-body", type=float, default=0.70, help="Full-body threshold 0..1")
-p.add_argument("--untouched", choices=["none", "next", "all"], default="all",
-               help="Low of signal candle must not be touched by next or ALL subsequent CLOSED candles")
-p.add_argument("--fresh-only", type=int, default=None,
-               help="If set (e.g. 1) keep only signals with candles_ago <= N (default OFF)")
-p.add_argument("--max-bottom-wick-ticks", type=int, default=None,
-               help="Optional: require bottom wick <= this many ticks (default OFF)")
-p.add_argument("--pick", choices=["latest","earliest"], default="latest",
-               help="If multiple signals exist after filtering, report latest (default) or earliest")
-p.add_argument("--suppress-by", choices=["none","higher_high","higher_close"], default="higher_high",
-               help="Drop a signal if any later CLOSED candle has a higher high/close (default higher_high)")
-p.add_argument("--symbols-file", default=None, help="Optional file with symbols one per line")
-p.add_argument("--workers", type=int, default=12, help="Thread workers")
-p.add_argument("--sleep", type=float, default=0.20, help="Sleep seconds between API calls")
-p.add_argument("--quote", default="USDT", help="Quote asset for universe, default USDT")
+p.add_argument("--api", default="https://api.mexc.com")
+p.add_argument("--interval", default="4h")
+p.add_argument("--window", type=int, default=180)                    # recent search window
+p.add_argument("--lookbacks", default="15,20")                       # N set
+p.add_argument("--min-body", type=float, default=0.70)               # full-body threshold
+p.add_argument("--bottom-wick-max-ticks", type=int, default=1)       # <= 1 tick
+p.add_argument("--untouched", choices=["all","next","none"], default="all")
+p.add_argument("--freshness-max", type=int, default=-1)              # -1 means OFF
+p.add_argument("--no-suppress", action="store_true")                 # disable suppression
+p.add_argument("--symbols-file", default=None)
+p.add_argument("--workers", type=int, default=12)
+p.add_argument("--sleep", type=float, default=0.20)
+p.add_argument("--quote", default="USDT")
+p.add_argument("--min-atr-ticks", type=int, default=3)               # ignore dead charts
 args = p.parse_args()
 
 LOOKBACKS = [int(x) for x in args.lookbacks.split(",") if x.strip()]
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/1.4"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/1.0"})
 DEFAULT_TICK = 1e-6
 
-# ---------- HTTP ----------
+# ---------- helpers ----------
 def http_get(url: str, params: Dict = None, max_retries: int = 6) -> requests.Response:
     params = params or {}
     backoff = args.sleep
     for _ in range(max_retries):
         r = SESSION.get(url, params=params, timeout=30)
         if r.status_code == 429:
-            time.sleep(backoff); backoff = min(backoff * 2, 5.0); continue
-        r.raise_for_status(); return r
-    r.raise_for_status(); return r
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()
+    return r
 
-# ---------- Universe & tick ----------
+def floor_to_tick(x: float, tick: float) -> float:
+    if tick and tick > 0:
+        return math.floor(x / tick) * tick
+    return x
+
+def last_closed_index(kl) -> int:
+    """Return index of the last CLOSED candle (guard against a still-forming last bar)."""
+    now_ms = int(time.time() * 1000)
+    i = len(kl) - 1
+    while i >= 0 and kl[i][6] > now_ms:
+        i -= 1
+    return i
+
+# ---------- universe ----------
 def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
     out: List[Tuple[str, float]] = []
-    ticks: Dict[str, float] = {}
     try:
         ei = http_get(f"{api}/api/v3/exchangeInfo").json()
         for s in ei.get("symbols", []):
             sym = s.get("symbol") or s.get("symbolName")
-            if not sym or not sym.endswith(quote): continue
+            if not sym:
+                continue
+            if s.get("quoteAsset") != quote:
+                continue
             status = s.get("status", "TRADING")
-            if status not in ("TRADING","ENABLED"): continue
+            if status not in ("TRADING", "ENABLED"):
+                continue
+            perms = set(s.get("permissions", []) or s.get("permissionList", []) or [])
+            spot_allowed = True if not perms else ("SPOT" in perms)
+            if not spot_allowed:
+                continue
             tick = DEFAULT_TICK
             for f in s.get("filters", []):
-                if f.get("filterType") in ("PRICE_FILTER","price_filter"):
+                if f.get("filterType") in ("PRICE_FILTER", "price_filter"):
                     ts = f.get("tickSize") or f.get("tick_size")
                     if ts:
-                        try: tick = float(ts)
-                        except: pass
-            ticks[sym] = tick
-        if ticks: out = sorted([(k, ticks[k]) for k in ticks])
+                        try:
+                            tick = float(ts)
+                        except:
+                            pass
+            out.append((sym, tick))
     except Exception:
         pass
+    # fallback guarded by quote filter
     if not out:
-        try:
-            tp = http_get(f"{api}/api/v3/ticker/price").json()
-            symbols = sorted({row["symbol"] for row in tp if row.get("symbol","").endswith(quote)})
-            out = [(s, DEFAULT_TICK) for s in symbols]
-        except Exception:
-            out = []
-    return out
+        tp = http_get(f"{api}/api/v3/ticker/price").json()
+        symbols = sorted({row["symbol"] for row in tp if str(row.get("symbol","")).endswith(quote)})
+        out = [(s, DEFAULT_TICK) for s in symbols]
+    return sorted(out)
 
 def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
-    out = []
+    res = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip().upper()
-            if s: out.append((s, DEFAULT_TICK))
-    return out
+            if s:
+                res.append((s, DEFAULT_TICK))
+    return res
 
-# ---------- Data ----------
+# ---------- data ----------
 def get_klines(symbol: str, interval: str, limit: int):
     time.sleep(args.sleep)
-    data = http_get(f"{args.api}/api/v3/klines", {"symbol":symbol,"interval":interval,"limit":limit}).json()
+    data = http_get(f"{args.api}/api/v3/klines", {
+        "symbol": symbol, "interval": interval, "limit": limit
+    }).json()
     kl = []
     for r in data:
-        ts = int(r[0]); o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4]); ct = int(r[6])
-        kl.append((ts,o,h,l,c,ct))
+        ts = int(r[0]); o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4])
+        v = float(r[5]); ct = int(r[6])
+        kl.append((ts, o, h, l, c, v, ct))
     return kl
 
-def last_closed_index(kl) -> int:
-    now_ms = int(time.time()*1000)
-    last = len(kl)-1
-    if last>=0 and now_ms < kl[last][5]:  # last bar still open
-        return max(0, last-1)
-    return last
-
 def to_utc(ms: int) -> str:
-    return datetime.fromtimestamp(ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-# ---------- Logic ----------
-def signals_for_symbol(rec: Tuple[str,float]) -> List[Tuple[int,str]]:
+# ---------- logic ----------
+def atr_ticks(kl, tick: float, look: int = 10) -> float:
+    last = last_closed_index(kl)
+    if last < 0 or last < look:
+        return 0.0
+    rngs = [abs(kl[i][2] - kl[i][3]) for i in range(last - look + 1, last + 1)]
+    atr = sum(rngs) / look
+    if tick <= 0:
+        tick = DEFAULT_TICK
+    return atr / tick
+
+def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     symbol, tick = rec
-    limit = max(args.window + max(LOOKBACKS) + 5, (args.fresh_only or 0) + max(LOOKBACKS) + 5)
+    last_need = max(LOOKBACKS) + 5
+    limit = max(args.window + last_need, last_need + 5)
     try:
         kl = get_klines(symbol, args.interval, limit)
     except Exception:
-        return []
+        return None
     if len(kl) < max(LOOKBACKS) + 2:
-        return []
+        return None
 
-    last_idx = last_closed_index(kl)
-    start = max(last_idx - args.window, max(LOOKBACKS))
-    tick_size = tick if tick and tick>0 else DEFAULT_TICK
+    # dead chart filter
+    if atr_ticks(kl, tick, 10) < args.min_atr_ticks:
+        return None
 
-    found: List[Tuple[int,str]] = []
+    last = last_closed_index(kl)                                  # last CLOSED candle
+    if last < 0:
+        return None
+    start = max(last - args.window, max(LOOKBACKS))
 
-    for idx in range(last_idx, start-1, -1):
-        ts,o,h,l,c,ct = kl[idx]
+    for idx in range(last, start - 1, -1):
+        ts, o, h, l, c, v, ct = kl[idx]
         rng = h - l
-        if rng <= 0: continue
-
-        # 1) green & full-body
-        if c <= o: continue
-        body_ratio = (c - o) / rng
-        if body_ratio < args.min_body: continue
-
-        # 2) close > max high of previous N CLOSED candles
-        passed = []
-        for N in LOOKBACKS:
-            if idx - N < 0: continue
-            prev_high = max(kl[idx-N:idx], key=lambda x: x[2])[2]
-            if c > prev_high: passed.append(N)
-        if not passed: continue
-        n_used = min(passed)
-
-        candles_ago = last_idx - idx
-        if args.fresh_only is not None and candles_ago > args.fresh_only:
+        if rng <= 0:
+            continue
+        if c <= o:
             continue
 
-        # 3) untouched-low
-        if args.untouched == "next":
-            if idx+1 <= last_idx and kl[idx+1][3] <= l: continue
-        elif args.untouched == "all":
-            if any(kl[j][3] <= l for j in range(idx+1, last_idx+1)): continue
+        body = (c - o) / rng
+        if body < args.min_body:
+            continue
 
-        # 4) optional wick filter
-        bottom_wick = max(0.0, min(o,c) - l)
+        # bottom wick ticks (use tick quantization)
+        tick_size = tick if tick and tick > 0 else DEFAULT_TICK
+        bottom_wick = max(0.0, min(o, c) - l)
         bottom_wick_ticks = int(round(bottom_wick / tick_size))
-        if args.max_bottom_wick_ticks is not None and bottom_wick_ticks > args.max_bottom_wick_ticks:
+        if bottom_wick_ticks > args.bottom_wick_max_ticks:
             continue
 
-        # 5) suppression by later price action
-        if args.suppress_by == "higher_high":
-            if any(kl[j][2] > h for j in range(idx+1, last_idx+1)):  # later CLOSED candle with higher HIGH
+        # strict breakout using tick floor
+        passed_N = []
+        for N in LOOKBACKS:
+            if idx - N < 0:
                 continue
-        elif args.suppress_by == "higher_close":
-            if any(kl[j][4] > c for j in range(idx+1, last_idx+1)):  # later CLOSED candle with higher CLOSE
+            prev_high = max(x[2] for x in kl[idx - N: idx])
+            if floor_to_tick(c, tick_size) > floor_to_tick(prev_high, tick_size):
+                passed_N.append(N)
+        if not passed_N:
+            continue
+        n_used = min(passed_N)
+
+        # freshness optional
+        candles_ago = last - idx
+        if args.freshness_max >= 0 and candles_ago > args.freshness_max:
+            break
+
+        # untouched rule
+        if args.untouched == "next":
+            if idx + 1 <= last and kl[idx + 1][3] <= l:
+                continue
+        elif args.untouched == "all":
+            if any(kl[j][3] <= l for j in range(idx + 1, last + 1)):
                 continue
 
-        row = ",".join([
-            symbol, to_utc(ts), f"{c:g}", f"{body_ratio:.2f}", f"{n_used}",
-            f"{h:g}", f"{l:g}", f"{bottom_wick_ticks}", f"{tick_size:g}", f"{candles_ago}",
-        ])
-        found.append((idx, row))
+        # suppression rule: keep only the latest surviving signal
+        if not args.no_suppress:
+            if any(kl[j][2] > h for j in range(idx + 1, last + 1)):
+                continue
 
-    return found
+        row = [
+            symbol,
+            to_utc(ts),
+            f"{c:g}",
+            f"{body:.2f}",
+            f"{n_used}",
+            f"{h:g}",
+            f"{l:g}",
+            f"{bottom_wick_ticks}",
+            f"{tick_size:g}",
+            f"{candles_ago}",
+        ]
+        return ",".join(row)
 
-# ---------- Main ----------
+    return None
+
+# ---------- main ----------
 def main():
     if args.symbols_file:
-        universe = load_universe_from_file(args.symbols_file); src = "symbols_file"
+        universe = load_universe_from_file(args.symbols_file)
+        source_note = "file"
     else:
-        universe = load_universe(args.api, args.quote); src = "exchangeInfo" if universe else "ticker/price"
-
-    print(f"# universe source={src} symbols={len(universe)}")
-    print("symbol,signal_utc,close,body_ratio,n_used,high,low,bottom_wick_ticks,tick_size,candles_ago")
-    if not universe: return
-
-    def pick_one(res_list: List[Tuple[int,str]]) -> Optional[str]:
-        if not res_list: return None
-        return (max if args.pick=="latest" else min)(res_list, key=lambda x: x[0])[1]
-
+        universe = load_universe(args.api, args.quote)
+        source_note = "exchangeInfo"
+    print(f"# universe source={source_note} symbols={len(universe)}")
+    print("symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago")
+    if not universe:
+        return
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for chosen in ex.map(lambda rec: pick_one(signals_for_symbol(rec)), universe, chunksize=32):
-            if chosen: print(chosen, flush=True)
+        for res in ex.map(scan_symbol, universe, chunksize=32):
+            if res:
+                print(res, flush=True)
 
 if __name__ == "__main__":
     main()
