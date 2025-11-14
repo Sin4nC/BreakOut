@@ -5,7 +5,7 @@
 # 1) Green full body  body_ratio >= 0.70
 # 2) Breakout  close_q > prev_high_q over previous 15 OR 20 CLOSED candles  either qualifies
 #    Quantization by tick size  x_q = floor(x / tick) * tick
-# 3) Untouched ALL subsequent CLOSED candles must NOT touch or break the signal LOW
+# 3) Untouched  ALL subsequent CLOSED candles must NOT touch or break the signal LOW
 #    Touch means low_q <= signal_low_q  equality counts as touch
 # 4) Suppression ON  if any later CLOSED candle makes a strictly higher HIGH than the signal  older signal is dropped
 # 5) Bottom wick threshold  <= 1 tick
@@ -28,10 +28,11 @@ ap.add_argument("--workers", type=int, default=12)
 ap.add_argument("--symbols-file", default=None)
 ap.add_argument("--quote", default="USDT")
 ap.add_argument("--sleep", type=float, default=0.16)
+ap.add_argument("--debug-symbol", default=None)        # optional single symbol debug
 args = ap.parse_args()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-2.0"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.0"})
 
 LOOKBACKS = [15, 20]
 MIN_BODY = 0.70
@@ -80,18 +81,14 @@ def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
 def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
     out: List[Tuple[str, float]] = []
     ticks: Dict[str, float] = {}
+    quote = quote.upper()
     try:
         ei = http_get(f"{api}/api/v3/exchangeInfo").json()
         for s in ei.get("symbols", []):
             sym = (s.get("symbol") or s.get("symbolName") or "").upper()
-            if not sym.endswith(quote.upper()):
+            if not sym or not sym.endswith(quote):
                 continue
-            status = (s.get("status") or "TRADING").upper()
-            if status not in ("TRADING", "ENABLED"):
-                continue
-            perms = [str(p).upper() for p in (s.get("permissions") or s.get("permissionList") or [])]
-            if perms and all(p not in ("SPOT", "SPOT_TRADING") for p in perms):
-                continue
+            # no status or permissions filter  keep all USDT spot style symbols
             tick = DEFAULT_TICK
             for f in s.get("filters", []):
                 if str(f.get("filterType") or "").upper() == "PRICE_FILTER":
@@ -99,17 +96,21 @@ def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
                     if ts:
                         try:
                             tick = float(ts)
-                        except:
+                        except Exception:
                             pass
             ticks[sym] = tick
         if ticks:
             out = sorted((k, ticks[k]) for k in ticks)
     except Exception:
         pass
+
     if not out:
+        # fallback  use ticker price and default tick
         try:
             tp = http_get(f"{api}/api/v3/ticker/price").json()
-            symbols = sorted({row["symbol"].upper() for row in tp if row.get("symbol", "").upper().endswith(quote.upper())})
+            symbols = sorted(
+                {row["symbol"].upper() for row in tp if row.get("symbol", "").upper().endswith(quote)}
+            )
             out = [(s, DEFAULT_TICK) for s in symbols]
         except Exception:
             out = []
@@ -118,13 +119,16 @@ def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
 # ---------- data ----------
 def get_klines(symbol: str, interval: str, limit: int):
     time.sleep(args.sleep)
-    data = http_get(f"{args.api}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit}).json()
+    data = http_get(
+        f"{args.api}/api/v3/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    ).json()
     kl = []
     for r in data:
         try:
             ot = int(r[0]); o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4]); ct = int(r[6])
             kl.append((ot, o, h, l, c, ct))
-        except:
+        except Exception:
             pass
     return kl
 
@@ -143,19 +147,22 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
         return None
 
     denom = tick if tick and tick > 0 else DEFAULT_TICK
+
     # bottom wick ticks
     bottom_wick = max(0.0, min(o, c) - l)
     bottom_wick_ticks = int(math.floor(bottom_wick / denom + 1e-12))
     if bottom_wick_ticks > MAX_BOTTOM_WICK_TICKS:
         return None
 
+    last = last_closed_index(kl)
+
     # breakout with tick quantization
     passed_N = []
-    last = last_closed_index(kl)
     for N in LOOKBACKS:
         if idx - N < 0:
             continue
-        prev_high = max(kl[idx - N: idx], key=lambda x: x[2])[2]
+        prev_slice = kl[idx - N: idx]
+        prev_high = max(prev_slice, key=lambda x: x[2])[2]
         prev_high_q = qfloor(prev_high, denom)
         close_q = qfloor(c, denom)
         if close_q > prev_high_q:
@@ -164,14 +171,14 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
         return None
     n_used = min(passed_N)
 
-    # untouched ALL  equality counts as touch
+    # untouched low  ALL subsequent CLOSED candles
     sig_low_q = qfloor(l, denom)
     for j in range(idx + 1, last + 1):
         low_q = qfloor(kl[j][3], denom)
         if low_q <= sig_low_q:
             return None
 
-    # suppression ON  any later higher HIGH kills the older signal
+    # suppression ON  any later higher HIGH kills this signal
     for j in range(idx + 1, last + 1):
         if kl[j][2] > h:
             return None
@@ -229,6 +236,17 @@ def main():
     print(f"# universe source={src} symbols={len(universe)}")
     print("symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago")
     if not universe:
+        return
+
+    # optional single symbol debug
+    if args.debug_symbol:
+        debug_sym = args.debug_symbol.upper()
+        for sym, tick in universe:
+            if sym == debug_sym:
+                line = scan_symbol((sym, tick))
+                if line:
+                    print(line)
+                return
         return
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
