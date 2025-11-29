@@ -1,18 +1,19 @@
 # breakout_scanner.py
-# MEXC Spot USDT 4H breakout scanner — strict rules per Forz4crypto (v3.1)
+# MEXC Spot USDT 4H breakout scanner — strict full-body breakouts per Forz4crypto (v3.2)
 #
 # Rules (fixed defaults)
 # 1) Green body: close > open
-#    body_ratio = (close - open) / (high - low)  >= 0.20
-# 2) Breakout: close_q > prev_high_q over previous 15 OR 20 CLOSED candles (either qualifies)
+#    body_ratio = (close - open) / (high - low)  >= 0.80
+# 2) Wicks small relative to full range:
+#    bottom_wick_ratio = (min(open, close) - low) / (high - low) <= 0.20
+#    top_wick_ratio    = (high - max(open, close)) / (high - low) <= 0.20
+#    (We still output bottom_wick_ticks in CSV for info.)
+# 3) Breakout: close_q > prev_high_q over previous 15 OR 20 CLOSED candles (either qualifies)
 #    Quantization by tick size: x_q = floor(x / tick) * tick
-# 3) Untouched: ALL subsequent CLOSED candles must NOT touch or break the signal LOW
+# 4) Untouched: ALL subsequent CLOSED candles must NOT touch or break the signal LOW
 #    Touch means low_q <= signal_low_q  (equality counts as touch)
-# 4) Suppression ON: if any later CLOSED candle makes a strictly higher HIGH than the signal,
+# 5) Suppression ON: if any later CLOSED candle makes a strictly higher HIGH than the signal,
 #    older signal is dropped
-# 5) Bottom wick not dominant:
-#    bottom_wick_ratio = (min(open, close) - low) / (high - low) <= 0.40
-#    (We still output bottom_wick_ticks in CSV, but gating is ratio-based)
 # 6) Freshness OFF: we allow old signals if they still satisfy 3 and 4
 #
 # Output: one latest surviving signal per symbol
@@ -40,11 +41,12 @@ ap.add_argument("--debug-symbol", default=None)        # optional single symbol 
 args = ap.parse_args()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.1"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.2"})
 
 LOOKBACKS = [15, 20]
-MIN_BODY = 0.20                 # relaxed so candles like RLC pass
-MAX_BOTTOM_WICK_RATIO = 0.40    # max fraction of full range allowed as bottom wick
+MIN_BODY = 0.80                 # super strong full body
+MAX_BOTTOM_WICK_RATIO = 0.20    # max 20% of range as lower wick
+MAX_TOP_WICK_RATIO = 0.20       # max 20% of range as upper wick
 DEFAULT_TICK = 1e-6
 
 
@@ -271,11 +273,18 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
 
     denom = tick if tick and tick > 0 else DEFAULT_TICK
 
-    # bottom wick: use ratio for gating, ticks for reporting
+    # wick calculations
     bottom_wick = max(0.0, min(o, c) - l)
+    top_wick = max(0.0, h - max(o, c))
+
     bottom_wick_ratio = bottom_wick / rng
+    top_wick_ratio = top_wick / rng
+
     if bottom_wick_ratio > MAX_BOTTOM_WICK_RATIO:
         return None
+    if top_wick_ratio > MAX_TOP_WICK_RATIO:
+        return None
+
     bottom_wick_ticks = int(math.floor(bottom_wick / denom + 1e-12))
 
     last = last_closed_index(kl)
