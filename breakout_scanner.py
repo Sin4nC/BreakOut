@@ -1,25 +1,33 @@
 # breakout_scanner.py
-# MEXC Spot USDT 4H breakout scanner — strict fixed rules per Forz4crypto
+# MEXC Spot USDT 4H breakout scanner — strict rules per Forz4crypto (v3.1)
 #
-# Fixed rules  no switches
-# 1) Green full body  body_ratio >= 0.70
-# 2) Breakout  close_q > prev_high_q over previous 15 OR 20 CLOSED candles  either qualifies
-#    Quantization by tick size  x_q = floor(x / tick) * tick
-# 3) Untouched  ALL subsequent CLOSED candles must NOT touch or break the signal LOW
-#    Touch means low_q <= signal_low_q  equality counts as touch
-# 4) Suppression ON  if any later CLOSED candle makes a strictly higher HIGH than the signal  older signal is dropped
-# 5) Bottom wick threshold  <= 1 tick
-# 6) Freshness OFF  we allow old signals if they still satisfy 3 and 4
+# Rules (fixed defaults)
+# 1) Green body: close > open
+#    body_ratio = (close - open) / (high - low)  >= 0.20
+# 2) Breakout: close_q > prev_high_q over previous 15 OR 20 CLOSED candles (either qualifies)
+#    Quantization by tick size: x_q = floor(x / tick) * tick
+# 3) Untouched: ALL subsequent CLOSED candles must NOT touch or break the signal LOW
+#    Touch means low_q <= signal_low_q  (equality counts as touch)
+# 4) Suppression ON: if any later CLOSED candle makes a strictly higher HIGH than the signal,
+#    older signal is dropped
+# 5) Bottom wick not dominant:
+#    bottom_wick_ratio = (min(open, close) - low) / (high - low) <= 0.40
+#    (We still output bottom_wick_ticks in CSV, but gating is ratio-based)
+# 6) Freshness OFF: we allow old signals if they still satisfy 3 and 4
 #
-# Output  one latest surviving signal per symbol
-# CSV header
+# Output: one latest surviving signal per symbol
+# CSV header:
 # symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago
 
-import argparse, concurrent.futures as cf, time, math, requests
+import argparse
+import concurrent.futures as cf
+import time
+import math
+import requests
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
-# ---------- CLI minimal ----------
+# ---------- CLI ----------
 ap = argparse.ArgumentParser("MEXC 4H Breakout Scanner")
 ap.add_argument("--api", default="https://api.mexc.com")
 ap.add_argument("--interval", default="4h")
@@ -32,11 +40,11 @@ ap.add_argument("--debug-symbol", default=None)        # optional single symbol 
 args = ap.parse_args()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.0"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.1"})
 
 LOOKBACKS = [15, 20]
-MIN_BODY = 0.70
-MAX_BOTTOM_WICK_TICKS = 1
+MIN_BODY = 0.20                 # relaxed so candles like RLC pass
+MAX_BOTTOM_WICK_RATIO = 0.40    # max fraction of full range allowed as bottom wick
 DEFAULT_TICK = 1e-6
 
 
@@ -67,7 +75,7 @@ def to_utc(ms: int) -> str:
 
 def last_closed_index(kl) -> int:
     """
-    Find the index of the last *closed* candle based on close time vs local now
+    Find the index of the last *closed* candle based on close time vs local now.
     """
     now_ms = int(time.time() * 1000)
     i = len(kl) - 1
@@ -83,7 +91,7 @@ def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
       SYMBOL
       or
       SYMBOL, tick_size
-    Lines starting with # are ignored
+    Lines starting with # are ignored.
     """
     out: List[Tuple[str, float]] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -126,7 +134,7 @@ def _extract_tick_from_filters(filters) -> Optional[float]:
 
 
 def _extract_tick_from_precisions(sym_info) -> Optional[float]:
-    # Fallback if filters do not expose a tick size
+    # Fallback if filters do not expose a tick size.
     for key in ("quotePrecision", "quoteAssetPrecision"):
         if key in sym_info:
             try:
@@ -146,13 +154,10 @@ def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
     try:
         ei = http_get(f"{api}/api/v3/exchangeInfo").json()
 
-        # MEXC currently follows a Binance like shape, but be defensive
         if isinstance(ei, dict):
             symbols_raw = ei.get("symbols")
-            if symbols_raw is None:
-                # Some implementations return a single symbol object
-                if "symbol" in ei and "baseAsset" in ei:
-                    symbols_raw = [ei]
+            if symbols_raw is None and "symbol" in ei and "baseAsset" in ei:
+                symbols_raw = [ei]
         elif isinstance(ei, list):
             symbols_raw = ei
         else:
@@ -175,13 +180,11 @@ def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
                 if "SPOT" not in perms.upper():
                     continue
 
-            # optional extra safety
             if s.get("isSpotTradingAllowed") is False:
                 continue
 
             st_flag = s.get("st")
             if isinstance(st_flag, bool) and st_flag:
-                # st true usually marks special / delisted state
                 continue
 
             tick = (
@@ -195,11 +198,10 @@ def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
             out = sorted(ticks.items())
 
     except Exception:
-        # best effort; will fall back below
         pass
 
     if not out:
-        # fallback: approximate tick from current prices
+        # Fallback: approximate tick from current prices.
         try:
             tp = http_get(f"{api}/api/v3/ticker/price").json()
             seen = set()
@@ -253,8 +255,8 @@ def get_klines(symbol: str, interval: str, limit: int):
 # ---------- logic ----------
 def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float, int, int]]:
     """
-    Returns (body_ratio, bottom_wick_ticks, lookback_used, candles_ago) if all rules pass
-    Otherwise returns None
+    Returns (body_ratio, bottom_wick_ticks, lookback_used, candles_ago) if all rules pass.
+    Otherwise returns None.
     """
     ts, o, h, l, c, _ = kl[idx]
     rng = h - l
@@ -269,16 +271,17 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
 
     denom = tick if tick and tick > 0 else DEFAULT_TICK
 
-    # bottom wick ticks
+    # bottom wick: use ratio for gating, ticks for reporting
     bottom_wick = max(0.0, min(o, c) - l)
-    bottom_wick_ticks = int(math.floor(bottom_wick / denom + 1e-12))
-    if bottom_wick_ticks > MAX_BOTTOM_WICK_TICKS:
+    bottom_wick_ratio = bottom_wick / rng
+    if bottom_wick_ratio > MAX_BOTTOM_WICK_RATIO:
         return None
+    bottom_wick_ticks = int(math.floor(bottom_wick / denom + 1e-12))
 
     last = last_closed_index(kl)
 
     # breakout with tick quantization
-    passed_N = []
+    passed_N: List[int] = []
     for N in LOOKBACKS:
         if idx - N < 0:
             continue
@@ -292,14 +295,14 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
         return None
     n_used = min(passed_N)
 
-    # untouched low  ALL subsequent CLOSED candles
+    # untouched low: ALL subsequent CLOSED candles
     sig_low_q = qfloor(l, denom)
     for j in range(idx + 1, last + 1):
         low_q = qfloor(kl[j][3], denom)
         if low_q <= sig_low_q:
             return None
 
-    # suppression ON  any later higher HIGH kills this signal
+    # suppression ON: any later higher HIGH kills this signal
     for j in range(idx + 1, last + 1):
         if kl[j][2] > h:
             return None
@@ -323,8 +326,9 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
         return None
     start = max(last - args.window + 1, max(LOOKBACKS))
 
-    # newest to older  pick first that survives  this is the latest surviving signal
     denom_tick = tick if tick and tick > 0 else DEFAULT_TICK
+
+    # newest to older: pick first that survives → latest surviving signal
     for idx in range(last, start - 1, -1):
         res = passes_fixed_rules(kl, idx, denom_tick)
         if res is None:
