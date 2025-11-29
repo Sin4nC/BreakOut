@@ -39,6 +39,7 @@ MIN_BODY = 0.70
 MAX_BOTTOM_WICK_TICKS = 1
 DEFAULT_TICK = 1e-6
 
+
 # ---------- utils ----------
 def http_get(url: str, params: Dict = None, max_retries: int = 6):
     params = params or {}
@@ -54,67 +55,178 @@ def http_get(url: str, params: Dict = None, max_retries: int = 6):
     r.raise_for_status()
     return r
 
+
 def qfloor(x: float, tick: float) -> float:
     t = tick if tick and tick > 0 else DEFAULT_TICK
     return math.floor(x / t) * t
 
+
 def to_utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+
 def last_closed_index(kl) -> int:
+    """
+    Find the index of the last *closed* candle based on close time vs local now
+    """
     now_ms = int(time.time() * 1000)
     i = len(kl) - 1
     while i >= 0 and kl[i][5] > now_ms:
         i -= 1
     return i
 
+
 # ---------- universe ----------
 def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
-    out = []
+    """
+    Optional file format:
+      SYMBOL
+      or
+      SYMBOL, tick_size
+    Lines starting with # are ignored
+    """
+    out: List[Tuple[str, float]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            s = line.strip().upper()
-            if s:
-                out.append((s, DEFAULT_TICK))
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = [p.strip() for p in raw.split(",")]
+            sym = parts[0].upper()
+            tick = DEFAULT_TICK
+            if len(parts) >= 2:
+                try:
+                    tick = float(parts[1])
+                except Exception:
+                    pass
+            out.append((sym, tick))
     return out
+
+
+def _extract_tick_from_filters(filters) -> Optional[float]:
+    if not isinstance(filters, list):
+        return None
+    for f in filters:
+        try:
+            ft = str(f.get("filterType") or f.get("filter_type") or "").upper()
+        except AttributeError:
+            continue
+        if "PRICE" not in ft:
+            continue
+        ts = f.get("tickSize") or f.get("tick_size")
+        if ts is None:
+            continue
+        try:
+            val = float(ts)
+            if val > 0:
+                return val
+        except Exception:
+            continue
+    return None
+
+
+def _extract_tick_from_precisions(sym_info) -> Optional[float]:
+    # Fallback if filters do not expose a tick size
+    for key in ("quotePrecision", "quoteAssetPrecision"):
+        if key in sym_info:
+            try:
+                prec = int(sym_info[key])
+                if 0 < prec < 12:
+                    return 10.0 ** (-prec)
+            except Exception:
+                continue
+    return None
+
 
 def load_universe(api: str, quote: str) -> List[Tuple[str, float]]:
     out: List[Tuple[str, float]] = []
     ticks: Dict[str, float] = {}
     quote = quote.upper()
+
     try:
         ei = http_get(f"{api}/api/v3/exchangeInfo").json()
-        for s in ei.get("symbols", []):
-            sym = (s.get("symbol") or s.get("symbolName") or "").upper()
+
+        # MEXC currently follows a Binance like shape, but be defensive
+        if isinstance(ei, dict):
+            symbols_raw = ei.get("symbols")
+            if symbols_raw is None:
+                # Some implementations return a single symbol object
+                if "symbol" in ei and "baseAsset" in ei:
+                    symbols_raw = [ei]
+        elif isinstance(ei, list):
+            symbols_raw = ei
+        else:
+            symbols_raw = []
+
+        for s in symbols_raw or []:
+            try:
+                sym = (s.get("symbol") or s.get("symbolName") or "").upper().strip()
+            except AttributeError:
+                continue
             if not sym or not sym.endswith(quote):
                 continue
-            # no status or permissions filter  keep all USDT spot style symbols
-            tick = DEFAULT_TICK
-            for f in s.get("filters", []):
-                if str(f.get("filterType") or "").upper() == "PRICE_FILTER":
-                    ts = f.get("tickSize") or f.get("tick_size")
-                    if ts:
-                        try:
-                            tick = float(ts)
-                        except Exception:
-                            pass
+
+            # spot only via permissions
+            perms = s.get("permissions")
+            if isinstance(perms, list):
+                if "SPOT" not in {str(p).upper() for p in perms}:
+                    continue
+            elif isinstance(perms, str):
+                if "SPOT" not in perms.upper():
+                    continue
+
+            # optional extra safety
+            if s.get("isSpotTradingAllowed") is False:
+                continue
+
+            st_flag = s.get("st")
+            if isinstance(st_flag, bool) and st_flag:
+                # st true usually marks special / delisted state
+                continue
+
+            tick = (
+                _extract_tick_from_filters(s.get("filters"))
+                or _extract_tick_from_precisions(s)
+                or DEFAULT_TICK
+            )
             ticks[sym] = tick
+
         if ticks:
-            out = sorted((k, ticks[k]) for k in ticks)
+            out = sorted(ticks.items())
+
     except Exception:
+        # best effort; will fall back below
         pass
 
     if not out:
-        # fallback  use ticker price and default tick
+        # fallback: approximate tick from current prices
         try:
             tp = http_get(f"{api}/api/v3/ticker/price").json()
-            symbols = sorted(
-                {row["symbol"].upper() for row in tp if row.get("symbol", "").upper().endswith(quote)}
-            )
-            out = [(s, DEFAULT_TICK) for s in symbols]
+            seen = set()
+            approx: List[Tuple[str, float]] = []
+            for row in tp:
+                sym = str(row.get("symbol") or "").upper()
+                if not sym or not sym.endswith(quote):
+                    continue
+                if sym in seen:
+                    continue
+                price_str = str(row.get("price") or "")
+                tick = DEFAULT_TICK
+                if "." in price_str:
+                    frac = price_str.split(".", 1)[1].rstrip("0")
+                    if frac:
+                        dec = len(frac)
+                        if 0 < dec < 12:
+                            tick = 10.0 ** (-dec)
+                seen.add(sym)
+                approx.append((sym, tick))
+            approx.sort()
+            out = approx
         except Exception:
             out = []
+
     return out
+
 
 # ---------- data ----------
 def get_klines(symbol: str, interval: str, limit: int):
@@ -126,15 +238,24 @@ def get_klines(symbol: str, interval: str, limit: int):
     kl = []
     for r in data:
         try:
-            ot = int(r[0]); o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4]); ct = int(r[6])
+            ot = int(r[0])
+            o = float(r[1])
+            h = float(r[2])
+            l = float(r[3])
+            c = float(r[4])
+            ct = int(r[6])
             kl.append((ot, o, h, l, c, ct))
         except Exception:
             pass
     return kl
 
+
 # ---------- logic ----------
 def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float, int, int]]:
-    # returns body_ratio, bottom_wick_ticks, n_used, candles_ago if ok else None
+    """
+    Returns (body_ratio, bottom_wick_ticks, lookback_used, candles_ago) if all rules pass
+    Otherwise returns None
+    """
     ts, o, h, l, c, _ = kl[idx]
     rng = h - l
     if rng <= 0:
@@ -186,6 +307,7 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
     candles_ago = last - idx
     return body_ratio, bottom_wick_ticks, n_used, candles_ago
 
+
 def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     symbol, tick = rec
     limit = max(args.window + max(LOOKBACKS) + 8, 120)
@@ -202,8 +324,9 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     start = max(last - args.window + 1, max(LOOKBACKS))
 
     # newest to older  pick first that survives  this is the latest surviving signal
+    denom_tick = tick if tick and tick > 0 else DEFAULT_TICK
     for idx in range(last, start - 1, -1):
-        res = passes_fixed_rules(kl, idx, tick if tick > 0 else DEFAULT_TICK)
+        res = passes_fixed_rules(kl, idx, denom_tick)
         if res is None:
             continue
         body_ratio, bottom_wick_ticks, n_used, candles_ago = res
@@ -217,11 +340,12 @@ def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
             f"{h:g}",
             f"{l:g}",
             f"{bottom_wick_ticks}",
-            f"{(tick if tick and tick > 0 else DEFAULT_TICK):g}",
+            f"{denom_tick:g}",
             f"{candles_ago}",
         ]
         return ",".join(row)
     return None
+
 
 # ---------- main ----------
 def main():
@@ -253,6 +377,7 @@ def main():
         for out in ex.map(scan_symbol, universe, chunksize=32):
             if out:
                 print(out, flush=True)
+
 
 if __name__ == "__main__":
     main()
