@@ -1,24 +1,24 @@
 # breakout_scanner.py
-# MEXC Spot USDT 4H breakout scanner — strict full-body breakouts per Forz4crypto (v3.2)
+# MEXC Spot USDT 4H full-body momentum scanner — shape only, no breakout rules (Forz4crypto v4.0)
+#
+# هدف: پیدا کردن آخرین کندل‌های 4H سبز با بدنه خیلی بزرگ و ویک‌های خیلی کوچک،
+# در بازه N کندل قبلی (پارامتر --window)، روی تمام جفت‌های اسپات USDT در MEXC.
 #
 # Rules (fixed defaults)
 # 1) Green body: close > open
-#    body_ratio = (close - open) / (high - low)  >= 0.80
-# 2) Wicks small relative to full range:
-#    bottom_wick_ratio = (min(open, close) - low) / (high - low) <= 0.20
-#    top_wick_ratio    = (high - max(open, close)) / (high - low) <= 0.20
-#    (We still output bottom_wick_ticks in CSV for info.)
-# 3) Breakout: close_q > prev_high_q over previous 15 OR 20 CLOSED candles (either qualifies)
-#    Quantization by tick size: x_q = floor(x / tick) * tick
-# 4) Untouched: ALL subsequent CLOSED candles must NOT touch or break the signal LOW
-#    Touch means low_q <= signal_low_q  (equality counts as touch)
-# 5) Suppression ON: if any later CLOSED candle makes a strictly higher HIGH than the signal,
-#    older signal is dropped
-# 6) Freshness OFF: we allow old signals if they still satisfy 3 and 4
+# 2) Full body:
+#       body_ratio = (close - open) / (high - low)  >= 0.80
+# 3) Small wicks relative to full range:
+#       bottom_wick_ratio = (min(open, close) - low) / (high - low) <= 0.20
+#       top_wick_ratio    = (high - max(open, close)) / (high - low) <= 0.20
+# 4) Meaningful move up:
+#       body_pct = (close - open) / open >= 0.03   (حداقل +۳٪ روی کندل)
+# 5) فقط کندل‌های بسته شده بررسی می‌شوند (هیچ کندل در حال تشکیل پذیرفته نمی‌شود)
 #
-# Output: one latest surviving signal per symbol
+# خروجی: برای هر سیمبل حداکثر یک ردیف، آخرین کندل 4H که همه شرایط بالا را پاس کرده.
+#
 # CSV header:
-# symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago
+# symbol,signal_utc,close,body_ratio,body_pct,high,low,bottom_wick_ticks,tick_size,candles_ago
 
 import argparse
 import concurrent.futures as cf
@@ -29,10 +29,14 @@ from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
 # ---------- CLI ----------
-ap = argparse.ArgumentParser("MEXC 4H Breakout Scanner")
+ap = argparse.ArgumentParser("MEXC 4H Full-Body Momentum Scanner")
 ap.add_argument("--api", default="https://api.mexc.com")
 ap.add_argument("--interval", default="4h")
-ap.add_argument("--window", type=int, default=180)     # how many CLOSED candles to scan backward
+ap.add_argument(
+    "--window",
+    type=int,
+    default=180,     # how many CLOSED candles to scan backward
+)
 ap.add_argument("--workers", type=int, default=12)
 ap.add_argument("--symbols-file", default=None)
 ap.add_argument("--quote", default="USDT")
@@ -41,12 +45,12 @@ ap.add_argument("--debug-symbol", default=None)        # optional single symbol 
 args = ap.parse_args()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/forz4crypto-3.2"})
+SESSION.headers.update({"User-Agent": "fullbody-scanner/forz4crypto-4.0"})
 
-LOOKBACKS = [15, 20]
-MIN_BODY = 0.80                 # super strong full body
-MAX_BOTTOM_WICK_RATIO = 0.20    # max 20% of range as lower wick
-MAX_TOP_WICK_RATIO = 0.20       # max 20% of range as upper wick
+MIN_BODY_RATIO = 0.80            # حداقل ۸۰٪ رنج باید بدنه باشد
+MAX_BOTTOM_WICK_RATIO = 0.20     # حداکثر ۲۰٪ رنج برای ویک پایین
+MAX_TOP_WICK_RATIO = 0.20        # حداکثر ۲۰٪ رنج برای ویک بالا
+MIN_BODY_PCT = 0.03              # حداقل +۳٪ حرکت رو به بالا روی بدنه نسبت به اوپن
 DEFAULT_TICK = 1e-6
 
 
@@ -72,12 +76,14 @@ def qfloor(x: float, tick: float) -> float:
 
 
 def to_utc(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
 
 
 def last_closed_index(kl) -> int:
     """
-    Find the index of the last *closed* candle based on close time vs local now.
+    آخرین کندل *بسته شده* را بر اساس close time نسبت به now پیدا می‌کند.
     """
     now_ms = int(time.time() * 1000)
     i = len(kl) - 1
@@ -255,25 +261,35 @@ def get_klines(symbol: str, interval: str, limit: int):
 
 
 # ---------- logic ----------
-def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float, int, int]]:
+def passes_fixed_rules(
+    kl,
+    idx: int,
+    tick: float,
+) -> Optional[Tuple[float, float, float, int]]:
     """
-    Returns (body_ratio, bottom_wick_ticks, lookback_used, candles_ago) if all rules pass.
+    Returns (body_ratio, bottom_wick_ticks, body_pct, candles_ago) if all rules pass.
     Otherwise returns None.
     """
     ts, o, h, l, c, _ = kl[idx]
     rng = h - l
     if rng <= 0:
         return None
+    if o <= 0:
+        return None
     if c <= o:
+        return None  # must be green
+
+    body = c - o
+    body_ratio = body / rng
+    if body_ratio < MIN_BODY_RATIO:
         return None
 
-    body_ratio = (c - o) / rng
-    if body_ratio < MIN_BODY:
+    body_pct = body / o
+    if body_pct < MIN_BODY_PCT:
         return None
 
     denom = tick if tick and tick > 0 else DEFAULT_TICK
 
-    # wick calculations
     bottom_wick = max(0.0, min(o, c) - l)
     top_wick = max(0.0, h - max(o, c))
 
@@ -288,68 +304,40 @@ def passes_fixed_rules(kl, idx: int, tick: float) -> Optional[Tuple[float, float
     bottom_wick_ticks = int(math.floor(bottom_wick / denom + 1e-12))
 
     last = last_closed_index(kl)
-
-    # breakout with tick quantization
-    passed_N: List[int] = []
-    for N in LOOKBACKS:
-        if idx - N < 0:
-            continue
-        prev_slice = kl[idx - N: idx]
-        prev_high = max(prev_slice, key=lambda x: x[2])[2]
-        prev_high_q = qfloor(prev_high, denom)
-        close_q = qfloor(c, denom)
-        if close_q > prev_high_q:
-            passed_N.append(N)
-    if not passed_N:
-        return None
-    n_used = min(passed_N)
-
-    # untouched low: ALL subsequent CLOSED candles
-    sig_low_q = qfloor(l, denom)
-    for j in range(idx + 1, last + 1):
-        low_q = qfloor(kl[j][3], denom)
-        if low_q <= sig_low_q:
-            return None
-
-    # suppression ON: any later higher HIGH kills this signal
-    for j in range(idx + 1, last + 1):
-        if kl[j][2] > h:
-            return None
-
     candles_ago = last - idx
-    return body_ratio, bottom_wick_ticks, n_used, candles_ago
+    return body_ratio, bottom_wick_ticks, body_pct, candles_ago
 
 
 def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     symbol, tick = rec
-    limit = max(args.window + max(LOOKBACKS) + 8, 120)
+    limit = max(args.window + 8, 120)
     try:
         kl = get_klines(symbol, args.interval, limit)
     except Exception:
         return None
-    if len(kl) < max(LOOKBACKS) + 5:
+    if len(kl) < 5:
         return None
 
     last = last_closed_index(kl)
-    if last < max(LOOKBACKS):
+    if last < 0:
         return None
-    start = max(last - args.window + 1, max(LOOKBACKS))
+    start = max(last - args.window + 1, 0)
 
     denom_tick = tick if tick and tick > 0 else DEFAULT_TICK
 
-    # newest to older: pick first that survives → latest surviving signal
+    # newest to older: pick first that survives → latest full-body momentum candle
     for idx in range(last, start - 1, -1):
         res = passes_fixed_rules(kl, idx, denom_tick)
         if res is None:
             continue
-        body_ratio, bottom_wick_ticks, n_used, candles_ago = res
+        body_ratio, bottom_wick_ticks, body_pct, candles_ago = res
         ts, o, h, l, c, _ = kl[idx]
         row = [
             symbol,
             to_utc(ts),
             f"{c:g}",
             f"{body_ratio:.2f}",
-            f"{n_used}",
+            f"{body_pct:.4f}",
             f"{h:g}",
             f"{l:g}",
             f"{bottom_wick_ticks}",
@@ -371,7 +359,10 @@ def main():
         src = "exchangeInfo" if universe else "ticker/price"
 
     print(f"# universe source={src} symbols={len(universe)}")
-    print("symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago")
+    print(
+        "symbol,signal_utc,close,body_ratio,body_pct,high,low,"
+        "bottom_wick_ticks,tick_size,candles_ago"
+    )
     if not universe:
         return
 
