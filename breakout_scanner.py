@@ -1,7 +1,7 @@
 # breakout_scanner_perp.py
-# MEXC USDT-M Perpetual 4H breakout scanner — Forz4crypto rules, SUPPRESSION OFF
+# MEXC USDT-M Perpetual 4H breakout scanner — Forz4crypto rules, SUPPRESSION OFF (WITH TELEGRAM)
 
-import argparse, concurrent.futures as cf, time, math, requests
+import argparse, concurrent.futures as cf, time, math, requests, os
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
@@ -25,6 +25,22 @@ args = ap.parse_args()
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "breakout-scanner/perp-forz4crypto-1.0"})
+
+# ----- telegram helper -----
+def send_telegram_message(text: str):
+    """Reads tokens from environment variables and sends a Markdown message to Telegram."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("# [Telegram] Bot token or Chat ID is missing in environment variables. Skipping alert.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        r.raise_for_status()
+        print("# [Telegram] Alert sent successfully!")
+    except Exception as e:
+        print(f"# [Telegram] Failed to send message: {e}")
 
 # ----- helpers -----
 PERIOD_SECS = {
@@ -225,10 +241,27 @@ def main():
     if not universe:
         return
 
+    # To collect all detected signals for the Telegram batch summary
+    detected_signals = []
+
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         for out in ex.map(scan_symbol, universe, chunksize=32):
             if out:
                 print(out, flush=True)
+                detected_signals.append(out)
+
+    # If signals were found, build a single clean message and send it to Telegram
+    if detected_signals:
+        telegram_text = "🟢 *MEXC 4H Breakout Alerts* 🟢\n\n"
+        for sig in detected_signals:
+            parts = sig.split(",")
+            telegram_text += f"📊 *{parts[0]}*\n"
+            telegram_text += f" • Price: `{parts[2]}`\n"
+            telegram_text += f" • Lookback (N): `{parts[4]}`\n"
+            telegram_text += f" • Candles Ago: `{parts[9]}`\n"
+            telegram_text += f" • UTC Time: {parts[1]}\n\n"
+        
+        send_telegram_message(telegram_text)
 
 if __name__ == "__main__":
     main()
