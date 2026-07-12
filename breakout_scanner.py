@@ -16,7 +16,7 @@ DEFAULT_TICK = 1e-6
 ap = argparse.ArgumentParser("MEXC Perp 4H Breakout Scanner")
 ap.add_argument("--api", default="https://contract.mexc.com")
 ap.add_argument("--interval", default="Hour4")       
-ap.add_argument("--window", type=int, default=180)   
+ap.add_argument("--window", type=int, default=30)     # limited to 30 candles (5 days on 4H timeframe)
 ap.add_argument("--workers", type=int, default=12)
 ap.add_argument("--symbols-file", default=None)      
 ap.add_argument("--sleep", type=float, default=0.16)
