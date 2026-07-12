@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: "5 */4 * * *"
   workflow_dispatch: {}
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: "node24"
 jobs:
   run:
     runs-on: ubuntu-latest
