@@ -1,5 +1,5 @@
-# binance_spot_4h_breakout_scanner.py
-# Binance SPOT 4H breakout scanner — Forz4crypto rules, SUPPRESSION OFF
+# breakout_scanner_perp.py
+# MEXC USDT-M Perpetual 4H breakout scanner — Forz4crypto rules, SUPPRESSION OFF
 
 import argparse, concurrent.futures as cf, time, math, requests
 from datetime import datetime, timezone
@@ -8,31 +8,37 @@ from typing import Dict, List, Tuple, Optional
 # ----- fixed rules -----
 LOOKBACKS = [15, 20]           # pass if close > max high of last 15 OR 20 closed candles
 MIN_BODY = 0.70                # full-body green
-MAX_BOTTOM_WICK_TICKS = 150    # relaxed to allow normal crypto volatility
+MAX_BOTTOM_WICK_TICKS = 150    # relaxed to allow normal crypto volatility (e.g., 150 ticks = $15 on BTC)
 SUPPRESSION = False            # keep historical signals even if later highs print
-DEFAULT_TICK = 1e-8
+DEFAULT_TICK = 1e-6
 
 # ----- CLI -----
-ap = argparse.ArgumentParser("Binance Spot 4H Breakout Scanner")
-ap.add_argument("--api", default="https://api.binance.com")
-ap.add_argument("--interval", default="4h")          # Binance spot intervals: 1m, 5m, 15m, 30m, 1h, 4h, 8h, 1d, 1w, 1M
+ap = argparse.ArgumentParser("MEXC Perp 4H Breakout Scanner")
+ap.add_argument("--api", default="https://contract.mexc.com")
+ap.add_argument("--interval", default="Hour4")       
 ap.add_argument("--window", type=int, default=30)     # limited to 30 candles (5 days on 4H timeframe)
-ap.add_argument("--workers", type=int, default=10)
+ap.add_argument("--workers", type=int, default=12)
 ap.add_argument("--symbols-file", default=None)      
-ap.add_argument("--sleep", type=float, default=0.1)
+ap.add_argument("--sleep", type=float, default=0.16)
+ap.add_argument("--allow-fallback", action="store_true")
 args = ap.parse_args()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "breakout-scanner/binance-spot-1.0"})
+SESSION.headers.update({"User-Agent": "breakout-scanner/perp-forz4crypto-1.0"})
 
 # ----- helpers -----
-def http_get(url: str, params: Dict = None, max_retries: int = 5):
+PERIOD_SECS = {
+    "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800, "Min60": 3600,
+    "Hour4": 14400, "Hour8": 28800, "Day1": 86400, "Week1": 604800, "Month1": 2592000
+}
+
+def http_get(url: str, params: Dict = None, max_retries: int = 6):
     params = params or {}
     back = max(args.sleep, 0.05)
     for _ in range(max_retries):
         r = SESSION.get(url, params=params, timeout=30)
         if r.status_code == 429:
-            time.sleep(back); back = min(back * 2.0, 5.0); continue
+            time.sleep(back); back = min(back * 1.8, 5.0); continue
         r.raise_for_status()
         return r
     r.raise_for_status()
@@ -45,59 +51,88 @@ def qfloor(x: float, tick: float) -> float:
 def to_utc(sec: int) -> str:
     return datetime.fromtimestamp(sec, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+def last_closed_index(kl, period_sec: int) -> int:
+    now = int(time.time())
+    i = len(kl) - 1
+    while i >= 0 and (kl[i][0] + period_sec) > now:
+        i -= 1
+    return i
+
 # ----- universe -----
 def load_universe_from_file(path: str) -> List[Tuple[str, float]]:
     out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip().upper()
-            if not s or not s.endswith("USDT"):
+            if not s or not s.endswith("_USDT"):
                 continue
             out.append((s, DEFAULT_TICK))
     return out
 
-def load_universe_from_api(api: str) -> List[Tuple[str, float]]:
-    res = http_get(f"{api}/api/v3/exchangeInfo").json()
-    symbols_data = res.get("symbols") or []
+def load_universe_from_detail(api: str) -> List[Tuple[str, float]]:
+    data = http_get(f"{api}/api/v1/contract/detail").json().get("data")
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
     out: List[Tuple[str, float]] = []
-    
-    for s in symbols_data:
+    for d in items:
         try:
-            if s.get("status") != "TRADING":
+            if str(d.get("settleCoin","")).upper() != "USDT":
                 continue
-            sym = s.get("symbol", "").upper()
-            if not sym.endswith("USDT"):
+            if int(d.get("state", 0)) != 0:
                 continue
-                
-            tick = DEFAULT_TICK
-            for f in s.get("filters", []):
-                if f.get("filterType") == "PRICE_FILTER":
-                    tick = float(f.get("tickSize") or DEFAULT_TICK)
-                    break
+            sym = str(d.get("symbol","")).upper()
+            if not sym.endswith("_USDT"):
+                continue
+            tick = float(d.get("priceUnit") or d.get("price_unit") or 0.0) or DEFAULT_TICK
             out.append((sym, tick))
         except:
             continue
     return sorted(out)
 
-# ----- data -----
-def get_klines(symbol: str, interval: str, limit: int):
-    time.sleep(args.sleep)
-    res = http_get(f"{args.api}/api/v3/klines", {
-        "symbol": symbol, "interval": interval, "limit": limit
-    }).json()
-    
-    kl = []
-    for item in res:
+def load_universe_fallback(api: str) -> List[Tuple[str, float]]:
+    tj = http_get(f"{api}/api/v1/contract/ticker").json()
+    arr = tj.get("data") or []
+    symbols = sorted({str(x.get("symbol","")).upper() for x in arr if str(x.get("symbol","")).upper().endswith("_USDT")})
+    return [(s, DEFAULT_TICK) for s in symbols]
+
+def load_universe(api: str) -> Tuple[List[Tuple[str, float]], str]:
+    try:
+        u = load_universe_from_detail(api)
+        if u:
+            return u, "contract/detail"
+    except Exception:
+        pass
+    if args.allow_fallback:
         try:
-            ts = int(item[0]) // 1000  
-            oo = float(item[1])
-            hh = float(item[2])
-            ll = float(item[3])
-            cc = float(item[4])
+            return load_universe_fallback(api), "contract/ticker_fallback"
+        except Exception:
+            return [], "fallback_error"
+    return [], "detail_error"
+
+# ----- data -----
+def get_klines(symbol: str, interval: str, need: int):
+    period = PERIOD_SECS.get(interval, 14400)
+    end = int(time.time())
+    start = end - (need + 10) * period
+    time.sleep(args.sleep)
+    j = http_get(f"{args.api}/api/v1/contract/kline/{symbol}", {
+        "interval": interval, "start": start, "end": end
+    }).json()
+    d = j.get("data") or {}
+    t = d.get("time") or []
+    o = d.get("open") or []
+    h = d.get("high") or []
+    l = d.get("low") or []
+    c = d.get("close") or []
+    kl = []
+    n = min(len(t), len(o), len(h), len(l), len(c))
+    for i in range(n):
+        try:
+            ts = int(t[i])
+            oo = float(o[i]); hh = float(h[i]); ll = float(l[i]); cc = float(c[i])
             kl.append((ts, oo, hh, ll, cc))
         except:
             continue
-    return kl
+    return kl, period
 
 # ----- rules -----
 def passes_rules(kl, idx: int, tick: float, last: int) -> Optional[Tuple[float, int, int, int]]:
@@ -143,15 +178,15 @@ def passes_rules(kl, idx: int, tick: float, last: int) -> Optional[Tuple[float, 
 
 def scan_symbol(rec: Tuple[str, float]) -> Optional[str]:
     symbol, tick = rec
-    limit = max(args.window + max(LOOKBACKS) + 5, 100)
+    need = max(args.window + max(LOOKBACKS) + 8, 120)
     try:
-        kl = get_klines(symbol, args.interval, limit)
+        kl, period = get_klines(symbol, args.interval, need)
     except Exception:
         return None
     if len(kl) < max(LOOKBACKS) + 5:
         return None
 
-    last = len(kl) - 2 
+    last = last_closed_index(kl, period)
     if last < max(LOOKBACKS):
         return None
     start = max(last - args.window + 1, max(LOOKBACKS))
@@ -182,8 +217,7 @@ def main():
         universe = load_universe_from_file(args.symbols_file)
         src = "symbols_file"
     else:
-        universe = load_universe_from_api(args.api)
-        src = "binance_spot_api"
+        universe, src = load_universe(args.api)
 
     print(f"# universe source={src} symbols={len(universe)} suppression={SUPPRESSION} interval={args.interval}")
     print("symbol,signal_utc,close,body_ratio,lookbackN,high,low,bottom_wick_ticks,tick_size,candles_ago")
